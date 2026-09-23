@@ -10,6 +10,19 @@ and this package adheres to
 Comparison links will be added after the first public component tags are
 published.
 
+## [3.35.0](https://github.com/oaslananka/kicad-mcp-pro/compare/mcp-server-v3.34.8...mcp-server-v3.35.0) (2026-09-23)
+
+
+### Features
+
+* add hardened OpenCode PR repair automation ([#921](https://github.com/oaslananka/kicad-mcp-pro/issues/921)) ([1d55c02](https://github.com/oaslananka/kicad-mcp-pro/commit/1d55c02e2f66c4a0bef7cd81aa7236427959500a))
+
+
+### Bug Fixes
+
+* harden OpenCode repair publishing permissions ([#923](https://github.com/oaslananka/kicad-mcp-pro/issues/923)) ([203c150](https://github.com/oaslananka/kicad-mcp-pro/commit/203c150254beb72a087f996cef4eac73728f5e70))
+* **net:** call Track.length() instead of dividing the bound method ([#919](https://github.com/oaslananka/kicad-mcp-pro/issues/919)) ([30d02c7](https://github.com/oaslananka/kicad-mcp-pro/commit/30d02c76b74b95ab83d588d43cbbf33630014e7f))
+
 ## [3.34.8](https://github.com/oaslananka/kicad-mcp-pro/compare/mcp-server-v3.34.7...mcp-server-v3.34.8) (2026-09-21)
 
 
