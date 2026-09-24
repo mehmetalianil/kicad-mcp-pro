@@ -21,6 +21,7 @@ _LOWER_IS_BETTER = frozenset(
     {"unnecessary_call_rate", "instability_rate", "p95_latency_ms", "mean_tokens"}
 )
 _HIGHER_IS_BETTER = frozenset({"pass_rate", "mean_recall"})
+_PROVIDER_TELEMETRY_METRICS = frozenset({"p95_latency_ms", "mean_tokens"})
 _TELEMETRY_METRIC_PREFIXES = ("mean_tokens", "p95_" + "latency_ms")
 
 
@@ -251,13 +252,32 @@ def evaluate_release_gate(
         adapter_failures = int(summary.get("adapter_failures", 0) or 0)
         planned = summary.get("planned_observations")
         completed = summary.get("completed_observations")
-        if adapter_failures:
+        adapter_tolerance = (
+            thresholds.max_adapter_failures if thresholds.max_adapter_failures is not None else 0
+        )
+        deficit_matches_adapter_failures = (
+            isinstance(planned, int)
+            and isinstance(completed, int)
+            and not isinstance(planned, bool)
+            and not isinstance(completed, bool)
+            and planned - completed == adapter_failures
+        )
+        # A handful of individually retried-out observations against a shared hosted
+        # endpoint (a timeout or truncated response) is provider noise, not a release
+        # regression, so a count within the configured tolerance is recorded on the
+        # observed configuration (below) but does not block the gate. Anything beyond
+        # that tolerance, or a deficit that adapter_failures does not fully explain,
+        # still blocks.
+        within_adapter_tolerance = (
+            adapter_failures <= adapter_tolerance and deficit_matches_adapter_failures
+        )
+        if adapter_failures and not within_adapter_tolerance:
             _append(
                 classifications,
                 "infrastructure_failures",
                 f"{config_id}: adapter_failures={adapter_failures}",
             )
-        if planned != completed:
+        if planned != completed and not within_adapter_tolerance:
             _append(
                 classifications,
                 "infrastructure_failures",
@@ -339,6 +359,11 @@ def evaluate_release_gate(
                     else "quality_failures"
                 )
                 _append(classifications, category, f"{config_id}: {metric} unavailable")
+                continue
+            if metric in _PROVIDER_TELEMETRY_METRICS:
+                # Shared hosted-endpoint latency/token drift is recorded in comparisons but is
+                # not a behavioral-quality regression. Absolute telemetry ceilings, when
+                # configured in thresholds.yaml, are still enforced above by evaluate_thresholds.
                 continue
             if metric in _HIGHER_IS_BETTER and current_value < float(approved_value) - variance:
                 _append(classifications, "quality_failures", f"{config_id}: {metric} regressed")

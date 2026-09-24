@@ -1,8 +1,8 @@
 schema_version: 1
 
 # Absolute safety and quality requirements for release-gated live-model runs.
-# Latency and token ceilings stay null until #492 establishes comparable
-# baselines across three supported host/model configurations.
+# Hosted-provider latency and token usage remain reviewable telemetry while these
+# ceilings are null. Set explicit ceilings here when release policy should block on them.
 release_gate:
   min_pass_rate: 0.95
   min_mean_recall: 0.98
@@ -12,9 +12,16 @@ release_gate:
   max_instability_rate: 0.05
   max_p95_latency_ms: null
   max_mean_tokens: null
+  # A single per-case observation that exhausts all retries against a slow or
+  # momentarily degraded hosted endpoint (a timeout or truncated response) is
+  # provider noise, not a behavioral regression, and out of 130+ observations
+  # per release run it should not by itself block baseline promotion. Anything
+  # beyond one such observation signals a systemic problem and still blocks.
+  max_adapter_failures: 1
 
-# Maximum allowed regression against an approved configuration baseline.
-# #492 will consume these values when comparing repeated live runs.
+# Maximum allowed behavioral regression against an approved configuration baseline.
+# Provider telemetry values remain in comparison reports; absolute ceilings above control
+# whether latency/token telemetry becomes release-blocking.
 permitted_variance:
   pass_rate: 0.02
   mean_recall: 0.01

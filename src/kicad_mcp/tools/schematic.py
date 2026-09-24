@@ -2381,6 +2381,75 @@ def _wire_segments_from_content(content: str) -> list[tuple[float, float, float,
     ]
 
 
+def get_symbol_primitive_bounds(
+    library: str,
+    symbol_name: str,
+    sym_x: float,
+    sym_y: float,
+    rotation: int = 0,
+    unit: int = 1,
+) -> tuple[float, float, float, float] | None:
+    """Extent of a placed symbol from its library primitives.
+
+    Covers polylines, rectangles, circles, arcs and pins, so plates, optical
+    arrows and enclosing circles are all inside the box rather than clipped.
+    """
+    sym_file = _symbol_library_file(library)
+    if sym_file is None:
+        return None
+
+    content = sym_file.read_text(encoding="utf-8", errors="ignore")
+    blocks = _collect_symbol_blocks(content, symbol_name)
+    if not blocks:
+        return None
+
+    xs: list[float] = []
+    ys: list[float] = []
+
+    for block in blocks:
+        block_name = _symbol_block_name(block)
+        child_blocks = _extract_child_symbol_blocks(block) if block_name is not None else []
+        unit_prefixes = (f"{block_name}_{unit}_", f"{block_name}_0_")
+        target_blocks = [
+            cblock for cname, cblock in child_blocks if cname.startswith(unit_prefixes)
+        ]
+        if not target_blocks:
+            # Symbols that carry their primitives inline -- flattened ``extends``
+            # chains and imported parts -- have no matching unit children, so the
+            # root block is parsed as-is.
+            target_blocks = [block]
+
+        for target in target_blocks:
+            for mx, my in re.findall(r"\(xy\s+([-\d.]+)\s+([-\d.]+)\)", target):
+                rx, ry = rotate_point(float(mx), -float(my), rotation)
+                xs.append(sym_x + rx)
+                ys.append(sym_y + ry)
+
+            for mx, my in re.findall(r"\((?:start|end|mid)\s+([-\d.]+)\s+([-\d.]+)\)", target):
+                rx, ry = rotate_point(float(mx), -float(my), rotation)
+                xs.append(sym_x + rx)
+                ys.append(sym_y + ry)
+
+            for cx_str, cy_str, r_str in re.findall(
+                r"\(circle\s+\(center\s+([-\d.]+)\s+([-\d.]+)\)\s+\(radius\s+([-\d.]+)\)", target
+            ):
+                rcx, rcy = rotate_point(float(cx_str), -float(cy_str), rotation)
+                r = float(r_str)
+                xs.extend([sym_x + rcx - r, sym_x + rcx + r])
+                ys.extend([sym_y + rcy - r, sym_y + rcy + r])
+
+            for mx, my, _ in re.findall(
+                r"\(pin\s+[a-z_]+\s+[a-z_]+\s+\(at\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\)", target
+            ):
+                rx, ry = rotate_point(float(mx), -float(my), rotation)
+                xs.append(sym_x + rx)
+                ys.append(sym_y + ry)
+
+    if not xs or not ys:
+        return None
+    return (round(min(xs), 4), round(min(ys), 4), round(max(xs), 4), round(max(ys), 4))
+
+
 def _get_symbol_bboxes(sexpr_content: str) -> list[BBox]:
     symbols: list[dict[str, Any]] = []
     cursor = 0
@@ -2394,7 +2463,21 @@ def _get_symbol_bboxes(sexpr_content: str) -> list[BBox]:
                 cursor += length
                 continue
         cursor += 1
-    return [BBox(*_symbol_bbox_bounds(symbol)) for symbol in symbols]
+    bboxes: list[BBox] = []
+    for symbol in symbols:
+        x = float(symbol.get("x", symbol.get("x_mm", 0.0)) or 0.0)
+        y = float(symbol.get("y", symbol.get("y_mm", 0.0)) or 0.0)
+        lib_id = str(symbol.get("lib_id", "") or "")
+        rotation = int(round(float(symbol.get("rotation", 0.0) or 0.0)))
+        unit = int(symbol.get("unit", 1) or 1)
+        bounds = None
+        if lib_id and ":" in lib_id:
+            library, symbol_name = _split_lib_id(lib_id)
+            bounds = get_symbol_primitive_bounds(library, symbol_name, x, y, rotation, unit)
+        if bounds is None:
+            bounds = _symbol_bbox_bounds(symbol)
+        bboxes.append(BBox(*bounds))
+    return bboxes
 
 
 def _remove_wire_blocks(content: str) -> str:
@@ -3612,12 +3695,16 @@ def _segment_intersects_bbox(
 ) -> bool:
     x1, y1, x2, y2 = segment
     if abs(y1 - y2) <= SNAP_TOLERANCE_MM:
-        if bbox.y_min + SNAP_TOLERANCE_MM < y1 < bbox.y_max - SNAP_TOLERANCE_MM:
-            return max(min(x1, x2), bbox.x_min) <= min(max(x1, x2), bbox.x_max)
+        if bbox.y_min - SNAP_TOLERANCE_MM <= y1 <= bbox.y_max + SNAP_TOLERANCE_MM:
+            return max(min(x1, x2), bbox.x_min - SNAP_TOLERANCE_MM) <= min(
+                max(x1, x2), bbox.x_max + SNAP_TOLERANCE_MM
+            )
         return False
     if abs(x1 - x2) <= SNAP_TOLERANCE_MM:
-        if bbox.x_min + SNAP_TOLERANCE_MM < x1 < bbox.x_max - SNAP_TOLERANCE_MM:
-            return max(min(y1, y2), bbox.y_min) <= min(max(y1, y2), bbox.y_max)
+        if bbox.x_min - SNAP_TOLERANCE_MM <= x1 <= bbox.x_max + SNAP_TOLERANCE_MM:
+            return max(min(y1, y2), bbox.y_min - SNAP_TOLERANCE_MM) <= min(
+                max(y1, y2), bbox.y_max + SNAP_TOLERANCE_MM
+            )
         return False
     return False
 
@@ -3633,42 +3720,99 @@ def _route_crosses_obstacle(
     )
 
 
+def _owning_bbox(point: tuple[float, float], obstacles: list[BBox]) -> BBox | None:
+    """Return the keepout that contains ``point``, if any.
+
+    Pins sit on their symbol's keepout outline, so matching a routed pin to its
+    own box needs a tolerance wider than the snap epsilon.
+    """
+    tol = SNAP_TOLERANCE_MM * 10
+    for obstacle in obstacles:
+        if (
+            obstacle.x_min - tol <= point[0] <= obstacle.x_max + tol
+            and obstacle.y_min - tol <= point[1] <= obstacle.y_max + tol
+        ):
+            return obstacle
+    return None
+
+
+def _escape_direction(point: tuple[float, float], owner: BBox) -> tuple[float, float]:
+    """Outward unit vector for a pin's 1-grid escape stub.
+
+    A pin lies on the perimeter of its symbol's keepout, so its distance to that
+    edge is zero and the nearest-edge test selects the pin's own edge exactly.  A
+    pin drawn inside the box -- a graphic that overhangs the pin, such as an LED
+    arrow -- falls back to the nearest edge, which is still the way out.
+    """
+    distances = (
+        (abs(point[0] - owner.x_min), (-1.0, 0.0)),
+        (abs(point[0] - owner.x_max), (1.0, 0.0)),
+        (abs(point[1] - owner.y_min), (0.0, -1.0)),
+        (abs(point[1] - owner.y_max), (0.0, 1.0)),
+    )
+    return min(distances, key=lambda candidate: candidate[0])[1]
+
+
 def _route_avoiding_obstacles(
     start: tuple[float, float],
     end: tuple[float, float],
     obstacles: list[BBox],
     snap_to_grid: bool,
 ) -> tuple[list[tuple[float, float, float, float]], str | None]:
-    """Route L-shape first, then a simple padded Z-route around obstacles."""
+    """Route orthogonal wire segments between two pins around obstacles.
+
+    Escape-and-route: step one grid unit along each pin's outward normal so A*
+    starts in free space rather than inside the symbol's own keepout, route
+    between the escape points with every keepout active as a hard obstacle, then
+    stitch the stubs back onto the pins.
+
+    When A* cannot find a route the direct run is returned together with an
+    ``obstacle_bypass_failed`` warning.  That fallback may cross a keepout: it is
+    a loud signal for the caller to resolve, not a usable route.
+    """
     direct = _deduplicate_segments(_manhattan_segments(start, end, snap_to_grid))
-    padded = [obstacle.padded(5.0) for obstacle in obstacles]
-    if not direct or not _route_crosses_obstacle(direct, padded):
+
+    # A clear straight or L run that touches no keepout needs no escape stub.
+    if direct and not _route_crosses_obstacle(direct, obstacles):
         return direct, None
 
+    grid = SCHEMATIC_GRID_MM
+
+    start_esc = start
+    start_owner = _owning_bbox(start, obstacles)
+    if start_owner is not None:
+        direction = _escape_direction(start, start_owner)
+        start_esc = _snap_point(
+            start[0] + direction[0] * grid, start[1] + direction[1] * grid, snap_to_grid
+        )
+
+    end_esc = end
+    end_owner = _owning_bbox(end, obstacles)
+    if end_owner is not None:
+        direction = _escape_direction(end, end_owner)
+        end_esc = _snap_point(
+            end[0] + direction[0] * grid, end[1] + direction[1] * grid, snap_to_grid
+        )
+
     router = SchematicRouter(
-        grid_mm=SCHEMATIC_GRID_MM,
+        grid_mm=grid,
         obstacles=[
             RouterBBox(obstacle.x_min, obstacle.y_min, obstacle.x_max, obstacle.y_max)
-            for obstacle in padded
+            for obstacle in obstacles
         ],
+        max_steps=20000,
     )
-    routed = router.route(start, end, max_bends=4)
-    if routed:
-        return _deduplicate_segments(routed), None
+    routed = router.route(start_esc, end_esc, max_bends=8)
+    if routed is None:
+        return direct, "WARNING: obstacle_bypass_failed"
 
-    max_y = max(max(start[1], end[1]), *(bbox.y_max for bbox in padded))
-    min_y = min(min(start[1], end[1]), *(bbox.y_min for bbox in padded))
-    candidate_offsets = [max_y + SCHEMATIC_GRID_MM, min_y - SCHEMATIC_GRID_MM]
-    for via_y in candidate_offsets:
-        raw = [
-            (start[0], start[1], start[0], via_y),
-            (start[0], via_y, end[0], via_y),
-            (end[0], via_y, end[0], end[1]),
-        ]
-        segments = _deduplicate_segments(raw)
-        if segments and not _route_crosses_obstacle(segments, padded):
-            return segments, None
-    return direct, "WARNING: obstacle_bypass_failed"
+    full_segments: list[tuple[float, float, float, float]] = []
+    if start_esc != start:
+        full_segments.append((start[0], start[1], start_esc[0], start_esc[1]))
+    full_segments.extend(routed)
+    if end_esc != end:
+        full_segments.append((end_esc[0], end_esc[1], end[0], end[1]))
+    return _deduplicate_segments(full_segments), None
 
 
 def _resolve_net_endpoint(
