@@ -156,14 +156,20 @@ class TestWriteKicadMcpConfig:
         assert data["transport"] == "streamable-http"
         assert data["port"] == 3334
 
-    def test_default_path_uses_home_dir(self) -> None:
+    def test_default_path_uses_home_dir(self, monkeypatch, tmp_path: Path) -> None:
+        # Point HOME at a temporary directory: the writer resolves its default
+        # output through Path.home(), and a developer machine may already hold an
+        # unrelated ~/.kicad-mcp whose contents break the cleanup below.
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
         kicad_path = Path("/usr/local/bin/kicad-cli")  # noqa: S108
         result = _write_kicad_mcp_config(kicad_path, "stdio", 0)
-        expected = Path.home() / ".kicad-mcp" / "config.json"
+        expected = tmp_path / ".kicad-mcp" / "config.json"
         assert result == expected
         assert result.exists()
         result.unlink()
-        # Clean up parent if empty
+        # The directory now holds nothing but the file just removed.
         result.parent.rmdir()
 
 
