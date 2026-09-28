@@ -120,6 +120,10 @@ def test_get_cli_capabilities_and_recent_projects_cover_fallbacks(
     assert discovery.get_cli_capabilities(missing_cli).version == "KiCad 10.0.1"
 
     monkeypatch.setattr(discovery.platform, "system", lambda: "Darwin")
+    # Substitute the platform install locations: the host may genuinely have
+    # KiCad under /Applications, which would otherwise make this assertion
+    # depend on the developer's machine rather than on the code.
+    monkeypatch.setattr(discovery, "_platform_library_roots", lambda _system: [])
     assert discovery.discover_library_paths(tmp_path / "cli") == {
         "root": None,
         "symbols": None,
@@ -138,6 +142,34 @@ def test_get_cli_capabilities_and_recent_projects_cover_fallbacks(
         "pcb": None,
         "schematic": None,
     }
+
+
+def test_discover_library_paths_returns_none_when_nothing_is_installed(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """A host with no KiCad library anywhere yields an all-None mapping."""
+    monkeypatch.setattr(discovery, "_platform_library_roots", lambda _system: [])
+
+    assert discovery.discover_library_paths(tmp_path / "missing-kicad-cli") == {
+        "root": None,
+        "symbols": None,
+        "footprints": None,
+    }
+
+
+def test_platform_library_roots_cover_every_supported_platform() -> None:
+    """Each platform reports its own conventional install roots."""
+    windows = discovery._platform_library_roots("Windows")
+    macos = discovery._platform_library_roots("Darwin")
+    linux = discovery._platform_library_roots("Linux")
+
+    assert all(str(path).startswith("C:\\") for path in windows)
+    assert any("KiCad.app" in str(path) for path in macos)
+    assert linux == [Path("/usr/share/kicad"), Path("/usr/local/share/kicad")]
+    # An unrecognised platform must fall back to the POSIX locations, never to
+    # an empty list that would silently disable discovery.
+    assert discovery._platform_library_roots("FreeBSD") == linux
 
 
 def _fake_kipy(monkeypatch, reported_path: Path) -> None:
