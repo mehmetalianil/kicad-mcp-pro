@@ -288,3 +288,83 @@ def test_resolve_repo_or_temp_allows_repo_and_temp_but_blocks_escape(tmp_path: P
     escaped_path = Path.home() / ".ssh" / "id_rsa"
     with pytest.raises(UnsafePathError):
         resolve_repo_or_temp(escaped_path, repo_root=repo_root)
+
+
+def test_auto_discovery_ignores_stem_schematic_symlink_escape_without_workspace_root(
+    tmp_path: Path, fake_cli: Path
+) -> None:
+    project = tmp_path / "demo"
+    project.mkdir()
+    (project / "demo.kicad_pro").touch()
+    outside = tmp_path / "victim.kicad_sch"
+    outside.write_text("(kicad_sch)\n", encoding="utf-8")
+    link = project / "demo.kicad_sch"
+    try:
+        link.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlink unavailable: {exc}")
+
+    cfg = KiCadMCPConfig(kicad_cli=fake_cli, project_dir=project)
+
+    assert cfg.sch_file is None
+
+
+def test_auto_discovery_pins_internal_schematic_symlink_target(
+    tmp_path: Path, fake_cli: Path
+) -> None:
+    project = tmp_path / "demo"
+    project.mkdir()
+    (project / "demo.kicad_pro").touch()
+    target = project / "actual.kicad_sch"
+    target.write_text("(kicad_sch)\n", encoding="utf-8")
+    link = project / "demo.kicad_sch"
+    try:
+        link.symlink_to(target.name)
+    except OSError as exc:
+        pytest.skip(f"symlink unavailable: {exc}")
+
+    cfg = KiCadMCPConfig(kicad_cli=fake_cli, project_dir=project)
+
+    assert cfg.sch_file == target.resolve()
+    link.unlink()
+    link.symlink_to(tmp_path / "later-victim.kicad_sch")
+    assert cfg.sch_file == target.resolve()
+
+
+def test_apply_project_rejects_active_file_symlink_escape_without_workspace_root(
+    tmp_path: Path, fake_cli: Path
+) -> None:
+    project = tmp_path / "demo"
+    project.mkdir()
+    safe_schematic = project / "safe.kicad_sch"
+    safe_schematic.write_text("(kicad_sch)\n", encoding="utf-8")
+    outside = tmp_path / "victim.kicad_sch"
+    outside.write_text("(kicad_sch)\n", encoding="utf-8")
+    link = project / "demo.kicad_sch"
+    try:
+        link.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlink unavailable: {exc}")
+
+    cfg = KiCadMCPConfig(kicad_cli=fake_cli, project_dir=project, sch_file=safe_schematic)
+    before = (
+        cfg.project_dir,
+        cfg.project_file,
+        cfg.pcb_file,
+        cfg.sch_file,
+        cfg.output_dir,
+        cfg.project_dir_is_explicit,
+    )
+
+    with pytest.raises(UnsafePathError, match="escapes workspace root"):
+        cfg.apply_project(project, sch_file=link, explicit=True)
+
+    after = (
+        cfg.project_dir,
+        cfg.project_file,
+        cfg.pcb_file,
+        cfg.sch_file,
+        cfg.output_dir,
+        cfg.project_dir_is_explicit,
+    )
+    assert after == before

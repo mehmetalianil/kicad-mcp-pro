@@ -530,6 +530,10 @@ class KiCadMCPConfig(BaseSettings):
             self.project_file = self.project_file or scan["project"]
             self.pcb_file = self.pcb_file or scan["pcb"]
             self.sch_file = self.sch_file or scan["schematic"]
+            for field_name in ("project_file", "pcb_file", "sch_file"):
+                path = getattr(self, field_name)
+                if path is not None:
+                    setattr(self, field_name, path.expanduser().resolve())
             self.output_dir = self.output_dir or self.project_dir / "output"
 
         libraries = _discover_library_paths(self.kicad_cli)
@@ -538,7 +542,13 @@ class KiCadMCPConfig(BaseSettings):
         self._validate_workspace_membership()
 
     def _validate_workspace_membership(self) -> None:
-        """Ensure configured project paths stay under an explicit workspace root."""
+        """Ensure active KiCad files remain in-project and all paths stay in-workspace."""
+        if self.project_dir is not None:
+            project_root = self.project_dir.expanduser().resolve()
+            for path in (self.project_file, self.pcb_file, self.sch_file):
+                if path is not None:
+                    assert_within(project_root, path)
+
         if self.workspace_root is None:
             return
         root = self.workspace_root.resolve()

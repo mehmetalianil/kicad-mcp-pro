@@ -356,6 +356,13 @@ def find_recent_projects(limit: int = 10) -> list[Path]:
     return project_files[:limit]
 
 
+def _is_confined_discovery_candidate(directory: Path, candidate: Path) -> bool:
+    """Return whether a discovered file resolves inside the scanned project directory."""
+    root = directory.expanduser().resolve()
+    resolved = candidate.expanduser().resolve()
+    return resolved.is_relative_to(root)
+
+
 def scan_project_dir(directory: Path) -> dict[str, Path | None]:
     """Scan a directory for KiCad project files."""
     result: dict[str, Path | None] = {
@@ -371,7 +378,11 @@ def scan_project_dir(directory: Path) -> dict[str, Path | None]:
         (".kicad_pcb", "pcb"),
         (".kicad_sch", "schematic"),
     ):
-        matches = sorted(directory.glob(f"*{extension}"))
+        matches = [
+            candidate
+            for candidate in sorted(directory.glob(f"*{extension}"))
+            if _is_confined_discovery_candidate(directory, candidate)
+        ]
         if not matches:
             continue
         # Board and root schematic share the project's stem; the directory name need not.
@@ -402,8 +413,12 @@ def select_canonical_kicad_file(
     candidate exists.  When the only candidate is numbered, it is still returned
     for backward compatibility with intentionally numbered project names.
     """
-    if not matches:
+    confined_matches = [
+        candidate for candidate in matches if _is_confined_discovery_candidate(directory, candidate)
+    ]
+    if not confined_matches:
         return None
+    matches = confined_matches
 
     canonical = directory / f"{directory.name}{extension}"
     for candidate in matches:
