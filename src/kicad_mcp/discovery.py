@@ -267,6 +267,28 @@ def _clear_cli_capabilities_cache() -> None:
 cast(Any, get_cli_capabilities).cache_clear = _clear_cli_capabilities_cache
 
 
+def _platform_library_roots(system: str) -> list[Path]:
+    """Return the conventional KiCad shared-support roots for a platform.
+
+    Kept separate from :func:`discover_library_paths` so callers and tests can
+    substitute the platform's install locations instead of depending on what
+    happens to be installed on the host.
+    """
+    if system == "Windows":
+        return [
+            Path(r"C:\Program Files\KiCad\11.0\share\kicad"),
+            Path(r"C:\Program Files\KiCad\10.0\share\kicad"),
+            Path(r"C:\Program Files\KiCad\9.0\share\kicad"),
+            Path(r"C:\Program Files\KiCad\8.0\share\kicad"),
+        ]
+    if system == "Darwin":
+        return [
+            Path("/Applications/KiCad/KiCad.app/Contents/SharedSupport"),
+            Path("/Applications/KiCad/KiCad.app/Contents/SharedSupport/share/kicad"),
+        ]
+    return [Path("/usr/share/kicad"), Path("/usr/local/share/kicad")]
+
+
 def discover_library_paths(cli_path: Path) -> dict[str, Path | None]:
     """Discover symbol and footprint library directories."""
     candidates: list[Path] = []
@@ -280,25 +302,7 @@ def discover_library_paths(cli_path: Path) -> dict[str, Path | None]:
         candidates.extend(parents)
         candidates.extend(parent / "share" / "kicad" for parent in parents)
 
-    system = platform.system()
-    if system == "Windows":
-        candidates.extend(
-            [
-                Path(r"C:\Program Files\KiCad\11.0\share\kicad"),
-                Path(r"C:\Program Files\KiCad\10.0\share\kicad"),
-                Path(r"C:\Program Files\KiCad\9.0\share\kicad"),
-                Path(r"C:\Program Files\KiCad\8.0\share\kicad"),
-            ]
-        )
-    elif system == "Darwin":
-        candidates.extend(
-            [
-                Path("/Applications/KiCad/KiCad.app/Contents/SharedSupport"),
-                Path("/Applications/KiCad/KiCad.app/Contents/SharedSupport/share/kicad"),
-            ]
-        )
-    else:
-        candidates.extend([Path("/usr/share/kicad"), Path("/usr/local/share/kicad")])
+    candidates.extend(_platform_library_roots(platform.system()))
 
     for base in candidates:
         share_root = base / "share" / "kicad" if not (base / "symbols").exists() else base
