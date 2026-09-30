@@ -954,6 +954,7 @@ def test_independent_nets_survive_geometry_union(boxes_by_ref: dict[str, BBox]) 
         for attempt in range(_ORDER_ATTEMPTS):
             order = list(range(len(nets)))
             if attempt:
+                # nosec B311 - the same seeded shuffle, used only to vary routing order.
                 random.Random(seed * _ORDER_ATTEMPTS + attempt).shuffle(order)  # noqa: S311
             net_segments, refused = _route_batch(nets, boxes, order)
             distinct = _distinct_nets(net_segments)
