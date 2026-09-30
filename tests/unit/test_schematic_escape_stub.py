@@ -14,6 +14,8 @@ it stopped being luck the moment a pin sat off-grid.
 
 from __future__ import annotations
 
+import pytest
+
 from kicad_mcp.tools.schematic import BBox, _route_avoiding_obstacles
 
 _EPS = 1e-6
@@ -43,52 +45,39 @@ def _assert_single_chain(segments: list[_Segment]) -> None:
     )
 
 
-def test_route_is_connected_for_a_pin_off_the_router_grid() -> None:
+def _assert_connected_manhattan(segments: list[_Segment]) -> None:
+    """One chain, and no diagonal step in it."""
+    _assert_single_chain(segments)
+    assert not [
+        segment
+        for segment in segments
+        if abs(segment[0] - segment[2]) > _EPS and abs(segment[1] - segment[3]) > _EPS
+    ], f"diagonal segment in a Manhattan run: {segments}"
+
+
+@pytest.mark.parametrize("snap_to_grid", [False, True])
+def test_route_is_connected_for_a_pin_off_the_router_grid(snap_to_grid: bool) -> None:
     """An off-grid pin must still yield one connected Manhattan run.
 
     Coordinates are deliberately not multiples of 1.27 mm: the pin at (10.0,
     12.0) escapes to (8.73, 12.0), which is between the nodes at x=8.89 and
     x=10.16.  Stitching to that raw landing is what used to leave the wire open.
+
+    Both settings of ``snap_to_grid`` are asserted because they used to fail in
+    different ways: with it off the stub missed the run and the wire was open,
+    and with it on the landing was moved onto the lattice but the stub bent off
+    the axis it left along, producing a diagonal.
     """
     segments, warning = _route_avoiding_obstacles(
         (10.0, 12.0),
         (12.0, 4.0),
         [BBox(10.0, 10.0, 14.0, 14.0)],
-        False,
+        snap_to_grid,
         None,
     )
 
     assert warning is None
-    _assert_single_chain(segments)
-    assert not [
-        segment
-        for segment in segments
-        if abs(segment[0] - segment[2]) > _EPS and abs(segment[1] - segment[3]) > _EPS
-    ], f"diagonal segment in a Manhattan run: {segments}"
-
-
-def test_route_is_connected_for_an_off_grid_pin_when_snapping_is_enabled() -> None:
-    """Snapping the landing rather than the stub is not enough on its own.
-
-    ``snap_to_grid`` moves the *landing* onto the lattice, which fixes the meeting
-    point but bends the stub off the axis it left along.  The stub is finished as
-    an L either way, so both settings give the same connected Manhattan run.
-    """
-    segments, warning = _route_avoiding_obstacles(
-        (10.0, 12.0),
-        (12.0, 4.0),
-        [BBox(10.0, 10.0, 14.0, 14.0)],
-        True,
-        None,
-    )
-
-    assert warning is None
-    _assert_single_chain(segments)
-    assert not [
-        segment
-        for segment in segments
-        if abs(segment[0] - segment[2]) > _EPS and abs(segment[1] - segment[3]) > _EPS
-    ], f"diagonal segment in a Manhattan run: {segments}"
+    _assert_connected_manhattan(segments)
 
 
 def test_route_is_connected_when_both_ends_are_off_grid() -> None:
@@ -102,4 +91,4 @@ def test_route_is_connected_when_both_ends_are_off_grid() -> None:
     )
 
     assert warning is None
-    _assert_single_chain(segments)
+    _assert_connected_manhattan(segments)
