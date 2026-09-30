@@ -495,26 +495,27 @@ class SchematicRouter:
         make KiCad union two nets into a silent short, so they are refused; a
         perpendicular crossing is legal and merely priced.
         """
-        if self._blocked(nxt, self._start_node, self._end_node):
-            return None
         turning = previous_dir is not None and previous_dir != direction
-        # A turn makes ``current`` a vertex of the path.  A vertex on a foreign
-        # wire is an endpoint-on-wire contact, which KiCad unions.
-        if turning and current not in self._exempt and self._occupied_kind(current) == 1:
-            return None
-        # A foreign wire's own endpoint must never be stood on, even in a straight
-        # through-move: that endpoint would lie on our run.
-        if nxt not in self._exempt and self._occupied_kind(nxt) == 2:
-            return None
-        if self._edge_overlaps_occupied(current, nxt):
-            return None
-        # A drawn boundary is not solid -- the route has to cross one to reach a
-        # pin inside it -- but travelling along one is refused: the wire would
-        # read as the block's own border rather than as a connection.
-        if self._hugs_boundary(current, nxt):
-            return None
         next_bends = bends + (1 if turning else 0)
-        if next_bends > self._max_bends:
+        # Everything that forbids a move is a property of the move itself, so the
+        # refusals read better as one question than as a stack of early returns.
+        # The reason each one is here is on the clause it belongs to.
+        refused = (
+            self._blocked(nxt, self._start_node, self._end_node)
+            # A turn makes ``current`` a vertex of the path, and a vertex on a
+            # foreign wire is an endpoint-on-wire contact, which KiCad unions.
+            or (turning and current not in self._exempt and self._occupied_kind(current) == 1)
+            # A foreign wire's own endpoint must never be stood on, even in a
+            # straight through-move: that endpoint would lie on our run.
+            or (nxt not in self._exempt and self._occupied_kind(nxt) == 2)
+            or self._edge_overlaps_occupied(current, nxt)
+            # A drawn boundary is not solid -- the route has to cross one to reach
+            # a pin inside it -- but travelling along one is refused: the wire
+            # would read as the block's own border rather than as a connection.
+            or self._hugs_boundary(current, nxt)
+            or next_bends > self._max_bends
+        )
+        if refused:
             return None
         move_cost = 1.0 + (3.0 if turning else 0.0)
         # Running alongside existing wire is the sheet's own idiom -- a bundle is
