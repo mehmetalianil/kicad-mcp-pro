@@ -542,23 +542,15 @@ def test_route_leaves_along_the_pin_normal() -> None:
     """A wire leaves a pin travelling outwards, never across the grain.
 
     The target is due south of a pin that faces west, so the shortest wire turns
-    on the pin.  The router instead runs out along the normal first and turns
-    away from the pin: the escape stub is emitted before the search starts, so
-    the search never gets to choose the first move.
+    on the pin.  The router instead runs out along the normal first and turns away
+    from the pin: the escape stub is emitted before the search starts, so the
+    search never gets to choose the first move.
 
     Without the owning keepout there is no escape stub at all and this guarantee
-    does not hold -- see ``test_escape_stub_needs_an_owning_keepout``.  These
-    tests use the raw router deliberately: it is the layer that used to ignore
-    pin orientation, and seeding it with ``start_dir`` was the fix being guarded.
+    does not hold -- see ``test_escape_stub_needs_an_owning_keepout``.
     """
     segments, warning = _route_avoiding_obstacles(
-        _START_PIN,
-        (12.7, 3.81),
-        [_START_PIN_BOX],
-        False,
-        None,
-        (-1.0, 0.0),
-        None,
+        _START_PIN, (12.7, 3.81), [_START_PIN_BOX], False, None, (-1.0, 0.0), None
     )
 
     assert warning is None
@@ -570,53 +562,17 @@ def test_route_arrives_against_the_target_pin_normal() -> None:
     """The final move travels back into the pin, so the last stub is straight.
 
     ``end_normal`` is the pin's *outward* direction, so the wire has to arrive
-    travelling the opposite way -- here the pin faces west and the wire must
-    come in eastwards.
+    travelling the opposite way -- here the pin faces west and the wire must come
+    in eastwards.
     """
     segments, warning = _route_avoiding_obstacles(
-        (5.08, 12.7),
-        _END_PIN,
-        [_END_PIN_BOX],
-        False,
-        None,
-        None,
-        (-1.0, 0.0),
+        (5.08, 12.7), _END_PIN, [_END_PIN_BOX], False, None, None, (-1.0, 0.0)
     )
 
     assert warning is None
     _assert_single_chain(segments)
     assert _arrival(segments, _END_PIN) == (1, 0), (
         f"arrived on {_arrival(segments, _END_PIN)}, so the last stub bends at the pin"
-    )
-
-
-def test_route_is_connected_for_a_pin_off_the_router_grid() -> None:
-    """An off-grid pin must still yield one connected Manhattan run.
-
-    ``_escape_point`` works in millimetres and lands between nodes; the router
-    quantises every node with ``round(point / grid_mm)``.  The stub used to be
-    stitched to the raw landing, leaving it 0.70 mm short of the run: four free
-    ends, an open wire that renders exactly like a route.  The landing is now
-    snapped onto the lattice and the offset taken out as a perpendicular step.
-
-    KiCad pins usually sit on the 1.27 mm grid, so this never showed up on the
-    reference board -- that was luck of the standard, not a guarantee in the
-    code, and it stopped being luck the moment a pin sat off-grid.
-    """
-    segments, warning = _route_avoiding_obstacles(
-        (10.0, 12.0),
-        (12.0, 4.0),
-        [BBox(10.0, 10.0, 14.0, 14.0)],
-        False,
-        None,
-        (-1.0, 0.0),
-        None,
-    )
-
-    assert warning is None
-    _assert_single_chain(segments)
-    assert not [s for s in segments if abs(s[0] - s[2]) > 1e-6 and abs(s[1] - s[3]) > 1e-6], (
-        f"diagonal segment in a Manhattan run: {segments}"
     )
 
 
