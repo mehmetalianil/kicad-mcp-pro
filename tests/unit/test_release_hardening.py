@@ -19,6 +19,7 @@ from kicad_mcp.discovery import CliCapabilities
 from kicad_mcp.server import (
     CLI_FAILURE_TOOL_NAMES,
     HEAVY_TOOL_NAMES,
+    _clean_tool_error,
     _is_origin_allowed,
     build_server,
 )
@@ -237,6 +238,21 @@ def test_cli_failure_tools_are_structured_error_candidates() -> None:
     assert "route_import_ses" not in CLI_FAILURE_TOOL_NAMES
 
 
+def test_clean_tool_error_preserves_actionable_sdk_v2_message() -> None:
+    wrapped = RuntimeError("Error executing tool pcb_route: route failed")
+    assert _clean_tool_error(wrapped) == "route failed"
+
+
+def test_clean_tool_error_unwraps_sdk_v2_hidden_cause() -> None:
+    try:
+        try:
+            raise ValueError("invalid footprint")
+        except ValueError as exc:
+            raise RuntimeError("Error executing tool pcb_place") from exc
+    except RuntimeError as wrapped:
+        assert _clean_tool_error(wrapped) == "invalid footprint"
+
+
 def test_audit_log_records_keys_without_sensitive_values(monkeypatch) -> None:
     from kicad_mcp import server as server_module
 
@@ -437,8 +453,8 @@ async def test_tool_exception_returns_structured_error() -> None:
     result = await server.call_tool("export_gerber", {})
 
     assert isinstance(result, CallToolResult)
-    assert result.isError is True
-    assert result.structuredContent is None
+    assert result.is_error is True
+    assert result.structured_content is None
     assert len(result.content) == 1
     text = result.content[0].text
     assert "CONFIGURATION_ERROR" in text
@@ -473,8 +489,8 @@ async def test_cli_nonzero_result_returns_structured_error(
     result = await server.call_tool("export_gerber", {})
 
     assert isinstance(result, CallToolResult)
-    assert result.isError is True
-    assert result.structuredContent is None
+    assert result.is_error is True
+    assert result.structured_content is None
     assert len(result.content) == 1
     text = result.content[0].text
     assert "CLI_COMMAND_FAILED" in text
@@ -597,7 +613,7 @@ async def test_template_parse_failure_is_reported_as_tool_error(monkeypatch) -> 
     )
 
     assert isinstance(result, CallToolResult)
-    assert result.isError is True
+    assert result.is_error is True
     text = result.content[0].text
     assert "Could not parse template 'CAN_transceiver'" in text
     assert "Hint:" in text
@@ -668,8 +684,8 @@ async def test_manufacturing_gate_block_returns_structured_validation_error(
     result = await server.call_tool("export_manufacturing_package", {})
 
     assert isinstance(result, CallToolResult)
-    assert result.isError is True
-    assert result.structuredContent is None
+    assert result.is_error is True
+    assert result.structured_content is None
     assert len(result.content) == 1
     text = result.content[0].text
     assert "VALIDATION_FAILED" in text
@@ -1221,8 +1237,8 @@ def test_structured_error_code_unavailable() -> None:
     from kicad_mcp.server import _structured_tool_error_from_message
 
     result = _structured_tool_error_from_message("kicad-cli is missing")
-    assert result.isError is True
-    assert result.structuredContent is None
+    assert result.is_error is True
+    assert result.structured_content is None
     assert len(result.content) == 1
     text = result.content[0].text
     assert "CLI_UNAVAILABLE" in text
