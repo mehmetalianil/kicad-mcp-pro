@@ -46,6 +46,8 @@ class PlaceSymbolBlock(Protocol):
         unit: int = 1,
         project_name: str,
         root_uuid: str,
+        properties: dict[str, str] | None = None,
+        mirror: str = "",
     ) -> str: ...
 
 
@@ -163,6 +165,8 @@ class SchematicBasicAuthoringService:
         unit: int,
         sheet: str | None,
         sheet_file: str | None,
+        mirror: str = "",
+        properties: dict[str, str] | None = None,
     ) -> str:
         """Add one placed symbol while preserving current warnings and ordering."""
         symbol_x, symbol_y = self.snap_point(x_mm, y_mm, snap_to_grid)
@@ -188,7 +192,11 @@ class SchematicBasicAuthoringService:
             *schematic_data["symbols"],
             *schematic_data["power_symbols"],
         ]
-        overlap_warning = self.point_near_existing(symbol_x, symbol_y, existing)
+        overlap_warning = (
+            self.point_near_existing(symbol_x, symbol_y, existing)
+            if library != "power"
+            else self.point_near_existing(symbol_x, symbol_y, schematic_data["power_symbols"])
+        )
 
         def mutator(current: str) -> str:
             updated = current
@@ -216,6 +224,8 @@ class SchematicBasicAuthoringService:
                 unit=unit,
                 project_name=self.project_name(),
                 root_uuid=root_uuid,
+                properties=properties,
+                mirror=mirror,
             )
             return self.append_before_sheet_instances(updated, block)
 
@@ -441,12 +451,13 @@ class SchematicBasicAuthoringService:
     ) -> str:
         """Add a generated-reference power symbol through the symbol path."""
         placed_x, placed_y = self.snap_point(x_mm, y_mm, snap_to_grid)
+        pwr_ref = power_reference_from_uuid(self.new_uuid())
         result = self.add_symbol(
             library="power",
             symbol_name=name,
             x_mm=x_mm,
             y_mm=y_mm,
-            reference=power_reference_from_uuid(self.new_uuid()),
+            reference=pwr_ref,
             value=name,
             footprint="",
             rotation=rotation,
@@ -458,6 +469,6 @@ class SchematicBasicAuthoringService:
         if "was not found" in result:
             return result
         return (
-            f"{result}\nPower symbol {name} placed at "
-            f"({self.format_mm(placed_x)}, {self.format_mm(placed_y)})"
+            f"Power symbol {name} (reference {pwr_ref}, pin 1) placed at "
+            f"({self.format_mm(placed_x)}, {self.format_mm(placed_y)})\n{result}"
         )

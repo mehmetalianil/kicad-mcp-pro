@@ -71,7 +71,13 @@ def register(mcp: FastMCP, dependencies: SchematicBasicAuthoringDependencies) ->
         unit: int,
         sheet: str | None,
         sheet_file: str | None,
+        mirror: str = "",
+        note: str = "",
+        properties: dict[str, str] | None = None,
     ) -> str:
+        merged_properties = dict(properties or {})
+        if note:
+            merged_properties["Note"] = note
         payload = AddSymbolInput(
             library=library,
             symbol_name=symbol_name,
@@ -81,8 +87,10 @@ def register(mcp: FastMCP, dependencies: SchematicBasicAuthoringDependencies) ->
             value=value,
             footprint=footprint,
             rotation=rotation,
+            mirror=mirror,
             snap_to_grid=snap_to_grid,
             unit=unit,
+            properties=merged_properties,
         )
         return service.add_symbol(
             payload.library,
@@ -97,6 +105,8 @@ def register(mcp: FastMCP, dependencies: SchematicBasicAuthoringDependencies) ->
             payload.unit,
             sheet,
             sheet_file,
+            payload.mirror,
+            payload.properties or None,
         )
 
     @mcp.tool()
@@ -114,11 +124,18 @@ def register(mcp: FastMCP, dependencies: SchematicBasicAuthoringDependencies) ->
         unit: int = 1,
         sheet: str | None = None,
         sheet_file: str | None = None,
+        mirror: str = "",
+        note: str = "",
+        properties: dict[str, str] | None = None,
     ) -> str:
         """Add a schematic symbol at an absolute coordinate.
 
         Coordinates snap to the 1.27 mm / 50 mil schematic grid by default; set
-        snap_to_grid=False only when an exact off-grid coordinate is intentional."""
+        snap_to_grid=False only when an exact off-grid coordinate is intentional.
+        Pass mirror="y" to flip horizontally across the Y axis (e.g. left-side
+        input connectors whose pins should face right toward the sheet center
+        while keeping Pin 1 on top). Pass note="..." to set the symbol's Note
+        property directly during placement."""
         return validated_add_symbol(
             library,
             symbol_name,
@@ -132,6 +149,9 @@ def register(mcp: FastMCP, dependencies: SchematicBasicAuthoringDependencies) ->
             unit,
             sheet,
             sheet_file,
+            mirror,
+            note,
+            properties,
         )
 
     @mcp.tool()

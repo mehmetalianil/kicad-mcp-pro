@@ -211,6 +211,9 @@ def body_box_from_pins(
     if pin_points:
         xs = [p[0] for p in pin_points]
         ys = [p[1] for p in pin_points]
+        if center is not None:
+            xs.append(center[0])
+            ys.append(center[1])
         return Box(min(xs) - pad_mm, min(ys) - pad_mm, max(xs) + pad_mm, max(ys) + pad_mm)
     cx, cy = center if center is not None else (0.0, 0.0)
     return Box(cx - min_half_mm, cy - min_half_mm, cx + min_half_mm, cy + min_half_mm)

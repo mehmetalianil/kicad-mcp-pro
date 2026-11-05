@@ -281,7 +281,10 @@ def _parse_effects(prop_block: str) -> tuple[float, frozenset[str], bool]:
     return font_mm, justify, hidden
 
 
-def _parse_instance_fields(symbol_block: str) -> tuple[str, list[TextField]]:
+def _parse_instance_fields(
+    symbol_block: str,
+    sym_angle: float = 0.0,
+) -> tuple[str, list[TextField]]:
     """Return ``(reference, visible_text_fields)`` for a placed symbol block."""
     reference = ""
     fields: list[TextField] = []
@@ -304,7 +307,17 @@ def _parse_instance_fields(symbol_block: str) -> tuple[str, list[TextField]]:
         font_mm, justify, hidden = _parse_effects(prop_block)
         if hidden or name in _HIDDEN_BY_DEFAULT_FIELDS or not text:
             continue
-        fields.append(TextField(text, float(fx), float(fy), float(fang), font_mm, justify=justify))
+        world_ang = (float(fang) - sym_angle) % 180.0
+        if int(round(sym_angle)) % 360 in (90, 180) and ("left" in justify or "right" in justify):
+            flipped = set(justify)
+            if "left" in flipped:
+                flipped.remove("left")
+                flipped.add("right")
+            elif "right" in flipped:
+                flipped.remove("right")
+                flipped.add("left")
+            justify = frozenset(flipped)
+        fields.append(TextField(text, float(fx), float(fy), world_ang, font_mm, justify=justify))
     return reference, fields
 
 
@@ -322,7 +335,7 @@ def parse_placed_symbols(sch_text: str) -> list[PlacedSymbol]:
         y = float(at_match.group(2))
         angle = float(at_match.group(3)) if at_match.group(3) else 0.0
         lib_id = lib_match.group(1)
-        reference, fields = _parse_instance_fields(block)
+        reference, fields = _parse_instance_fields(block, sym_angle=angle)
         body = _instance_body_box(lib_id, x, y, angle, local_points)
         placed.append(PlacedSymbol(reference, lib_id, x, y, angle, body, tuple(fields)))
     return placed

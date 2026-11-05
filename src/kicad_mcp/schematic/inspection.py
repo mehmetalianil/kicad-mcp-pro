@@ -13,7 +13,7 @@ type ParseSchematic = Callable[[Path], SchematicData]
 type WithDiagnostics = Callable[[str, Path], str]
 type PopulationRecords = Callable[[str | None, str | None], list[dict[str, Any]]]
 type SymbolAvailableUnits = Callable[[str, str], set[int]]
-type PinPositions = Callable[[str, str, float, float, int, int], dict[str, tuple[float, float]]]
+type PinPositions = Callable[..., dict[str, tuple[float, float]]]
 
 
 @dataclass(frozen=True)
@@ -116,6 +116,7 @@ class SchematicInspectionService:
         y_mm: float,
         rotation: int = 0,
         unit: int = 1,
+        mirror: str = "",
     ) -> str:
         """Return absolute symbol pin positions using the legacy public format."""
         available_units = self.symbol_available_units(library, symbol_name)
@@ -132,10 +133,12 @@ class SchematicInspectionService:
             y_mm,
             rotation,
             unit,
+            mirror,
         )
         if not positions:
             return f"Could not calculate pin positions for {library}:{symbol_name}."
-        lines = [f"{library}:{symbol_name} @ ({x_mm}, {y_mm}) rot={rotation} unit={unit}:"]
+        mirror_note = f" mirror={mirror}" if mirror else ""
+        lines = [f"{library}:{symbol_name} @ ({x_mm}, {y_mm}) rot={rotation}{mirror_note} unit={unit}:"]
         for pin, coordinates in sorted(positions.items()):
             lines.append(f"- Pin {pin}: ({coordinates[0]:.4f}, {coordinates[1]:.4f}) mm")
         return "\n".join(lines)

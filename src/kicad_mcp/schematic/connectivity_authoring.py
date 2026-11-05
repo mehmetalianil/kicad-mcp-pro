@@ -130,6 +130,14 @@ class SchematicConnectivityAuthoringService:
     #: has to cross one to reach a pin inside it.  Defaults to none so a caller
     #: that predates the rule keeps working; only wire routing consults it.
     get_module_boundaries: Callable[[str], list[BoundingBoxLike]] = _no_module_boundaries
+    truncate_same_net_tap: Callable[
+        [str, tuple[float, float], tuple[float, float], list[WireSegment]],
+        list[WireSegment],
+    ] = lambda _content, _start, _end, segments: segments
+    advance_stem_junction: Callable[
+        [str, tuple[float, float], tuple[float, float] | None],
+        tuple[tuple[float, float], tuple[float, float] | None],
+    ] = lambda _content, pin, normal: (pin, normal)
 
     def add_pin_labels(
         self,
@@ -245,8 +253,15 @@ class SchematicConnectivityAuthoringService:
                 block_oy = float(block.get("y", 0.0))
                 block_rot = int(block.get("rotation", 0) or 0)
                 block_unit = int(block.get("unit", 1) or 1)
+                block_mirror = str(block.get("mirror", "") or "")
                 block_positions = self.get_pin_positions(
-                    block_library, block_symbol_name, block_ox, block_oy, block_rot, block_unit
+                    block_library,
+                    block_symbol_name,
+                    block_ox,
+                    block_oy,
+                    block_rot,
+                    block_unit,
+                    *((block_mirror,) if block_mirror else ()),
                 )
                 candidate_point = block_positions.get(pin)
                 if candidate_point is None:
@@ -257,6 +272,7 @@ class SchematicConnectivityAuthoringService:
                         block_oy,
                         block_rot,
                         block_unit,
+                        *((block_mirror,) if block_mirror else ()),
                     )
                     candidate_point = aliases.get(pin) or aliases.get(pin.upper())
                 if candidate_point is not None:
@@ -320,9 +336,16 @@ class SchematicConnectivityAuthoringService:
             length = max(stub_mm, 10.16) if uy else stub_mm
             ex = round(px + ux * length, 4)
             ey = round(py + uy * length, 4)
+            is_pwr_net = self.is_power_net(net)
+            clearance_x = terminal_clearance_mm
+            clearance_y = (
+                self.snap_tolerance_mm
+                if dense_terminal_mode
+                else (2.0 if (ux != 0 and uy == 0 and not is_pwr_net) else terminal_clearance_mm)
+            )
             stagger_steps = 0
             while stagger_steps < max_stagger_steps and any(
-                abs(ex - qx) < terminal_clearance_mm and abs(ey - qy) < terminal_clearance_mm
+                abs(ex - qx) < clearance_x and abs(ey - qy) < clearance_y
                 for qx, qy in occupied_terminals
             ):
                 length += stagger_step_mm
@@ -333,7 +356,7 @@ class SchematicConnectivityAuthoringService:
             wire_blocks.append(self.wire_block(px, py, ex, ey))
             suffix = f"; staggered {stagger_steps} step(s)" if stagger_steps else ""
 
-            if self.is_power_net(net):
+            if is_pwr_net:
                 if net not in power_lib_defs:
                     lib_def = self.load_lib_symbol("power", net)
                     if lib_def is None:
@@ -440,6 +463,8 @@ class SchematicConnectivityAuthoringService:
 
         first_library, first_symbol = self.split_lib_id(str(first["lib_id"]))
         second_library, second_symbol = self.split_lib_id(str(second["lib_id"]))
+        first_mirror = str(first.get("mirror", "") or "")
+        second_mirror = str(second.get("mirror", "") or "")
         first_pins = self.get_pin_positions(
             first_library,
             first_symbol,
@@ -447,6 +472,7 @@ class SchematicConnectivityAuthoringService:
             float(first["y"]),
             int(first["rotation"]),
             int(first["unit"]),
+            *((first_mirror,) if first_mirror else ()),
         )
         second_pins = self.get_pin_positions(
             second_library,
@@ -455,6 +481,7 @@ class SchematicConnectivityAuthoringService:
             float(second["y"]),
             int(second["rotation"]),
             int(second["unit"]),
+            *((second_mirror,) if second_mirror else ()),
         )
         start = first_pins.get(payload.pin1)
         end = second_pins.get(payload.pin2)
@@ -462,41 +489,63 @@ class SchematicConnectivityAuthoringService:
             return f"Pin {payload.pin1} was not found on {payload.ref1}."
         if end is None:
             return f"Pin {payload.pin2} was not found on {payload.ref2}."
+        if start == end:
+            return f"{payload.ref1}:{payload.pin1} and {payload.ref2}:{payload.pin2} already overlap."
 
         # The direction each wire must leave and reach its pin in.  Without this
         # the search may leave a pin sideways for free, which turns at the pin
         # and lets two same-length candidates tie on cost.
         start_normal = self.get_pin_outward_normals(
-            first_library, first_symbol, int(first["rotation"]), int(first["unit"])
+            first_library,
+            first_symbol,
+            int(first["rotation"]),
+            int(first["unit"]),
+            *((first_mirror,) if first_mirror else ()),
         ).get(payload.pin1)
         end_normal = self.get_pin_outward_normals(
-            second_library, second_symbol, int(second["rotation"]), int(second["unit"])
+            second_library,
+            second_symbol,
+            int(second["rotation"]),
+            int(second["unit"]),
+            *((second_mirror,) if second_mirror else ()),
         ).get(payload.pin2)
 
-        content = self.active_schematic_file().read_text(encoding="utf-8", errors="ignore")
-        obstacles = self.get_symbol_bboxes(content)
-        boundaries = self.get_module_boundaries(content)
-        # Wires that already belong to another net are what this route must not
-        # merge with; the pins' own net is exempt so a partly drawn net can be
-        # extended to its remaining pins.
-        occupied = self.foreign_wire_segments(content, [start, end])
-        segments, routing_warning = self.route_avoiding_obstacles(
-            start,
-            end,
-            obstacles,
-            payload.snap_to_grid,
-            occupied,
-            start_normal,
-            end_normal,
-            boundaries,
-        )
-        crossings = self.count_net_crossings(segments, occupied)
-        if not segments:
-            return (
-                f"{payload.ref1}:{payload.pin1} and {payload.ref2}:{payload.pin2} already overlap."
-            )
+        route_state: dict[str, Any] = {
+            "segments": [],
+            "routing_warning": None,
+            "crossings": 0,
+        }
 
         def mutator(current: str) -> str:
+            eff_start, eff_start_normal = self.advance_stem_junction(
+                current, start, start_normal
+            )
+            eff_end, eff_end_normal = self.advance_stem_junction(
+                current, end, end_normal
+            )
+            obstacles = self.get_symbol_bboxes(current)
+            boundaries = self.get_module_boundaries(current)
+            # Wires that already belong to another net are what this route must not
+            # merge with; the pins' own net is exempt so a partly drawn net can be
+            # extended to its remaining pins.
+            occupied = self.foreign_wire_segments(current, [eff_start, eff_end])
+            segments, routing_warning = self.route_avoiding_obstacles(
+                eff_start,
+                eff_end,
+                obstacles,
+                payload.snap_to_grid,
+                occupied,
+                eff_start_normal,
+                eff_end_normal,
+                boundaries,
+            )
+            segments = self.truncate_same_net_tap(current, eff_start, eff_end, segments)
+            crossings = self.count_net_crossings(segments, occupied)
+            route_state["segments"] = segments
+            route_state["routing_warning"] = routing_warning
+            route_state["crossings"] = crossings
+            if not segments:
+                return current
             updated = current
             for segment in segments:
                 updated = self.append_before_sheet_instances(
@@ -506,6 +555,13 @@ class SchematicConnectivityAuthoringService:
             return updated
 
         self.transactional_write(mutator, None)
+        segments = route_state["segments"]
+        routing_warning = route_state["routing_warning"]
+        crossings = route_state["crossings"]
+        if not segments:
+            return (
+                f"{payload.ref1}:{payload.pin1} and {payload.ref2}:{payload.pin2} already overlap."
+            )
         result = self.reload_schematic()
         # A crossing is legal in KiCad -- no junction is placed -- so it is worth
         # stating plainly rather than leaving the reader to squint at the render.

@@ -99,6 +99,7 @@ def register(mcp: FastMCP, dependencies: SchematicInspectionDependencies) -> Non
         return service.population_status(reference=reference, sheet=sheet)
 
     @mcp.tool()
+    @headless_compatible
     def sch_get_pin_positions(
         library: str,
         symbol_name: str,
@@ -106,8 +107,9 @@ def register(mcp: FastMCP, dependencies: SchematicInspectionDependencies) -> Non
         y_mm: float,
         rotation: int = 0,
         unit: int = 1,
+        mirror: str = "",
     ) -> str:
-        """Calculate absolute pin positions for a given symbol placement."""
+        """Calculate absolute pin positions for a given symbol placement (including mirror='x'|'y')."""
         return service.pin_positions(
             library,
             symbol_name,
@@ -115,6 +117,7 @@ def register(mcp: FastMCP, dependencies: SchematicInspectionDependencies) -> Non
             y_mm,
             rotation,
             unit,
+            mirror,
         )
 
     @mcp.tool()

@@ -27,7 +27,22 @@ DEFAULT_LINE_PITCH_MM = 1.778  # one schematic grid step between stacked lines
 
 # Side preference when several sides are equally clear. KiCad favours placing
 # text to the right, then above, matching most engineers' reading habit.
-_SIDE_ORDER = ("right", "top", "left", "bottom")
+# Off-center shoulder positions follow the 4 cardinal midpoints so 4-sided ICs
+# with center VDD/VSS pins can place Reference/Value cleanly on an open corner.
+_SIDE_ORDER = (
+    "right",
+    "top",
+    "left",
+    "bottom",
+    "top_left",
+    "top_right",
+    "bottom_left",
+    "bottom_right",
+    "right_top",
+    "right_bottom",
+    "left_top",
+    "left_bottom",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,10 +75,35 @@ def pin_sides(body: Box, pin_points: Sequence[tuple[float, float]]) -> frozenset
     A pin is attributed to the edge it is closest to; this tells the placer which
     sides carry wires and should be avoided when there is a free alternative.
     """
+    if not pin_points:
+        return frozenset()
+    xs = [p[0] for p in pin_points]
+    ys = [p[1] for p in pin_points]
+    x_span = max(xs) - min(xs)
+    y_span = max(ys) - min(ys)
+    cx, cy = body.center
+    edge_tol = 1e-3
+    # Degenerate 1-D pin arrays:
+    # - Collinear horizontal pins (y_span ~ 0): if on the symbol center Y, pins exit left & right
+    #   (horizontal two-terminal device such as D, D_Small, SW_Push, or rotated R/C); otherwise
+    #   it is a single-row connector exiting top or bottom.
+    if y_span <= edge_tol and x_span > edge_tol:
+        if abs(ys[0] - cy) <= edge_tol:
+            return frozenset({"left", "right"})
+        return frozenset({"bottom" if ys[0] >= cy else "top"})
+    # - Collinear vertical pins (x_span ~ 0): if on the symbol center X, pins exit top & bottom
+    #   (vertical two-terminal device such as R, C, L at 0/180 deg); otherwise it is a
+    #   single-column connector exiting left or right.
+    if x_span <= edge_tol and y_span > edge_tol:
+        if abs(xs[0] - cx) <= edge_tol:
+            return frozenset({"top", "bottom"})
+        return frozenset({"right" if xs[0] >= cx else "left"})
+
     sides: set[str] = set()
     for px, py in pin_points:
         # Attribute the pin to the edge it projects past; an interior pin (rare)
-        # falls to its nearest edge so it is still avoided.
+        # falls to its nearest edge so it is still avoided (rounded to 1e-6 mm
+        # so 1e-14 IEEE-754 representation differences do not flip ties).
         if px <= body.x_min:
             sides.add("left")
         elif px >= body.x_max:
@@ -74,10 +114,10 @@ def pin_sides(body: Box, pin_points: Sequence[tuple[float, float]]) -> frozenset
             sides.add("bottom")
         else:
             gaps = {
-                "left": abs(px - body.x_min),
-                "right": abs(px - body.x_max),
-                "top": abs(py - body.y_min),
-                "bottom": abs(py - body.y_max),
+                "left": round(abs(px - body.x_min), 6),
+                "right": round(abs(px - body.x_max), 6),
+                "top": round(abs(py - body.y_min), 6),
+                "bottom": round(abs(py - body.y_max), 6),
             }
             sides.add(min(gaps, key=lambda k: gaps[k]))
     return frozenset(sides)
@@ -103,6 +143,31 @@ def _stacked_boxes_for_side(
         start_y = cy - total_h / 2.0
         for i, _spec in enumerate(specs):
             placements.append((x, start_y + i * pitch_mm, justify))
+    elif side in ("right_top", "right_bottom", "left_top", "left_bottom"):
+        is_right = side.startswith("right")
+        is_top = side.endswith("top")
+        justify = frozenset({"left"}) if is_right else frozenset({"right"})
+        x = body.x_max + margin_mm if is_right else body.x_min - margin_mm
+        start_y = (
+            body.y_min + line_h / 2.0
+            if is_top
+            else body.y_max - total_h - line_h / 2.0
+        )
+        for i, _spec in enumerate(specs):
+            placements.append((x, start_y + i * pitch_mm, justify))
+    elif side in ("top_left", "top_right", "bottom_left", "bottom_right"):
+        is_top = side.startswith("top")
+        is_left = side.endswith("left")
+        justify = frozenset({"right"}) if is_left else frozenset({"left"})
+        x = (cx - 2.54) if is_left else (cx + 2.54)
+        if is_top:
+            base_y = body.y_min - margin_mm - line_h / 2.0
+            for i, _spec in enumerate(specs):
+                placements.append((x, base_y - (len(specs) - 1 - i) * pitch_mm, justify))
+        else:
+            base_y = body.y_max + margin_mm + line_h / 2.0
+            for i, _spec in enumerate(specs):
+                placements.append((x, base_y + i * pitch_mm, justify))
     else:  # top / bottom — stack vertically, centred horizontally
         justify = frozenset()
         if side == "top":
@@ -133,7 +198,8 @@ def _side_cost(
     for box in boxes:
         for obstacle in obstacles:
             overlap += box.intersection_area(obstacle)
-    pin_conflict = 1.0 if side in avoid_sides else 0.0
+    base_side = side.split("_", 1)[0]
+    pin_conflict = 1.0 if base_side in avoid_sides else 0.0
     rank = _SIDE_ORDER.index(side) if side in _SIDE_ORDER else len(_SIDE_ORDER)
     return (pin_conflict, overlap, rank)
 
@@ -157,6 +223,8 @@ def autoplace_fields(
     """
     visible = [s for s in specs if s.text]
     avoid = pin_sides(body, pin_points)
+    pin_halos = [Box(px - 0.5, py - 0.5, px + 0.5, py + 0.5) for px, py in pin_points]
+    all_obstacles = list(obstacles) + pin_halos
 
     best_cost: tuple[float, float, int] | None = None
     best_coords: list[tuple[float, float, frozenset[str]]] = []
@@ -168,7 +236,7 @@ def autoplace_fields(
             TextField(spec.text, x, y, 0.0, spec.font_mm, bold=spec.bold, justify=just).box()
             for spec, (x, y, just) in zip(visible, coords, strict=True)
         ]
-        cost = _side_cost(side, boxes, obstacles, avoid)
+        cost = _side_cost(side, boxes, all_obstacles, avoid)
         if best_cost is None or cost < best_cost:
             best_cost = cost
             best_coords = coords

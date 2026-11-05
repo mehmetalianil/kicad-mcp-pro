@@ -42,6 +42,7 @@ class AddSymbolInput(BaseModel):
     value: str = Field(min_length=1, max_length=240)
     footprint: str = Field(default="", max_length=240)
     rotation: Literal[0, 90, 180, 270] = 0
+    mirror: Literal["", "x", "y"] = ""
     unit: int = Field(default=1, ge=1, le=64)
     snap_to_grid: bool = True
     properties: dict[str, str] = Field(

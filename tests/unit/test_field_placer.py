@@ -87,3 +87,31 @@ def test_deterministic_output() -> None:
     first = autoplace_fields(VERTICAL_BODY, VERTICAL_PINS, [], specs)
     second = autoplace_fields(VERTICAL_BODY, VERTICAL_PINS, [], specs)
     assert first == second
+
+
+def test_four_sided_ic_places_fields_on_clear_shoulder() -> None:
+    # A 4-sided MCU (e.g. STM32F030F4Px) has pins on all 4 sides, with center
+    # VDD/VSS wires blocking the top and bottom midpoints and signal wires/labels
+    # blocking the left and right midpoints. The placer should select an open
+    # shoulder (e.g. top_left) with zero obstacle overlap.
+    mcu_body = Box(133.35, 80.01, 161.29, 125.73)
+    mcu_pins = [
+        (147.32, 81.28),   # VDD top center
+        (149.86, 81.28),   # VDDA top center-right
+        (147.32, 124.46),  # VSS bottom center
+        (134.62, 101.60),  # PF1 left midpoint
+        (160.02, 101.60),  # PA5 right midpoint
+    ]
+    obstacles = [
+        Box(147.0, 63.5, 150.2, 81.5),    # top center VDD/VDDA wires
+        Box(147.0, 124.0, 147.6, 130.0),  # bottom center VSS wire
+        Box(117.0, 98.0, 134.6, 108.0),   # left midpoint wires & labels
+        Box(160.0, 93.0, 180.0, 118.0),   # right midpoint wires & labels
+    ]
+    specs = [FieldSpec("Reference", "U1"), FieldSpec("Value", "STM32F030F4P6")]
+    placements = autoplace_fields(mcu_body, mcu_pins, obstacles, specs)
+    for spec, placement in zip(specs, placements, strict=True):
+        box = placement.text_field(spec.text, spec.font_mm).box()
+        for obs in obstacles:
+            assert box.intersection_area(obs) == 0.0
+

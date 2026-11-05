@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import math
@@ -566,8 +567,12 @@ class _KicadSchApiBackend:
             symbols: list[dict[str, Any]] = []
             power_symbols: list[dict[str, Any]] = []
             power_flags = cast(dict[str, bool], compatibility["lib_symbol_power_flags"])
+            symbol_mirrors = _placed_symbol_mirrors(
+                sch_file.read_text(encoding="utf-8", errors="ignore")
+            )
             for component in cast(list[_PlacedComponentLike], list(schematic.components.all())):
                 parsed = _component_to_symbol_dict(component)
+                parsed["mirror"] = symbol_mirrors.get(_placed_symbol_key(parsed), "")
                 # Power symbols are identified by the (power) flag of their embedded
                 # definition; project libraries such as "ecc83-pp:GND" carry it too.
                 is_power = power_flags.get(parsed["lib_id"])
@@ -2318,6 +2323,7 @@ def _parse_symbol_block(block: str) -> dict[str, Any] | None:
         return None
     at_match = re.search(r"\(at\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\)", block)
     unit_match = re.search(r"\(unit\s+(\d+)\)", block)
+    mirror_match = re.search(r"\(mirror\s+([xy])\)", block)
     ref_match = re.search(rf'\(property\s+"Reference"\s+{_STRING_PATTERN}', block)
     value_match = re.search(rf'\(property\s+"Value"\s+{_STRING_PATTERN}', block)
     footprint_match = re.search(rf'\(property\s+"Footprint"\s+{_STRING_PATTERN}', block)
@@ -2333,6 +2339,7 @@ def _parse_symbol_block(block: str) -> dict[str, Any] | None:
         "y": float(at_match.group(2)) if at_match else 0.0,
         "rotation": int(round(float(at_match.group(3)))) if at_match else 0,
         "unit": int(unit_match.group(1)) if unit_match else 1,
+        "mirror": mirror_match.group(1) if mirror_match else "",
     }
 
 
@@ -2399,29 +2406,32 @@ def _extract_wires(content: str) -> list[dict[str, Any]]:
     wires: list[dict[str, Any]] = []
     cursor = 0
     while cursor < len(content):
-        if content[cursor:].startswith("(wire"):
-            block, length = _extract_block(content, cursor)
-            if block:
-                pts_match = re.search(
-                    (
-                        r"\(pts\s+\(xy\s+([-\d.]+)\s+([-\d.]+)\)\s+"
-                        r"\(xy\s+([-\d.]+)\s+([-\d.]+)\)\s*\)"
-                    ),
-                    block,
-                )
-                if pts_match is not None:
-                    wire_record: dict[str, Any] = {
-                        "x1": float(pts_match.group(1)),
-                        "y1": float(pts_match.group(2)),
-                        "x2": float(pts_match.group(3)),
-                        "y2": float(pts_match.group(4)),
-                    }
-                    uuid_match = re.search(r'\(uuid\s+"([^"]+)"\)', block)
-                    if uuid_match is not None:
-                        wire_record["uuid"] = uuid_match.group(1)
-                    wires.append(wire_record)
-                cursor += length
-                continue
+        idx = content.find("(wire", cursor)
+        if idx < 0:
+            break
+        cursor = idx
+        block, length = _extract_block(content, cursor)
+        if block:
+            pts_match = re.search(
+                (
+                    r"\(pts\s+\(xy\s+([-\d.]+)\s+([-\d.]+)\)\s+"
+                    r"\(xy\s+([-\d.]+)\s+([-\d.]+)\)\s*\)"
+                ),
+                block,
+            )
+            if pts_match is not None:
+                wire_record: dict[str, Any] = {
+                    "x1": float(pts_match.group(1)),
+                    "y1": float(pts_match.group(2)),
+                    "x2": float(pts_match.group(3)),
+                    "y2": float(pts_match.group(4)),
+                }
+                uuid_match = re.search(r'\(uuid\s+"([^"]+)"\)', block)
+                if uuid_match is not None:
+                    wire_record["uuid"] = uuid_match.group(1)
+                wires.append(wire_record)
+            cursor += length
+            continue
         cursor += 1
     return wires
 
@@ -2505,8 +2515,9 @@ def _place_rotated_points(
     points: Iterable[tuple[float, float]],
     origin: tuple[float, float],
     rotation: int,
+    mirror: str = "",
 ) -> None:
-    """Map library-local points onto the sheet, rotating as KiCad does.
+    """Map library-local points onto the sheet, rotating and mirroring as KiCad does.
 
     Split out because the same rotate-and-place step is needed for ``(xy ...)``,
     ``(start|end|mid ...)`` and circle geometry, and three copies of it inside one
@@ -2515,6 +2526,10 @@ def _place_rotated_points(
     sym_x, sym_y = origin
     for local_x, local_y in points:
         rotated_x, rotated_y = rotate_point(local_x, -local_y, -rotation)
+        if mirror == "x":
+            rotated_y = -rotated_y
+        elif mirror == "y":
+            rotated_x = -rotated_x
         xs.append(sym_x + rotated_x)
         ys.append(sym_y + rotated_y)
 
@@ -2525,6 +2540,7 @@ def _add_symbol_primitive_points(
     target: str,
     origin: tuple[float, float],
     rotation: int,
+    mirror: str = "",
 ) -> None:
     """Append all primitive points required to bound one symbol block."""
     _place_rotated_points(
@@ -2533,6 +2549,7 @@ def _add_symbol_primitive_points(
         ((float(px), float(py)) for px, py in _XY_RE.findall(target)),
         origin,
         rotation,
+        mirror,
     )
     _place_rotated_points(
         xs,
@@ -2540,6 +2557,7 @@ def _add_symbol_primitive_points(
         ((float(px), float(py)) for px, py in _START_END_MID_RE.findall(target)),
         origin,
         rotation,
+        mirror,
     )
     for center_x, center_y, radius in _CIRCLE_RE.findall(target):
         cx, cy, r = float(center_x), float(center_y), float(radius)
@@ -2549,6 +2567,7 @@ def _add_symbol_primitive_points(
             ((cx - r, cy), (cx + r, cy), (cx, cy - r), (cx, cy + r)),
             origin,
             rotation,
+            mirror,
         )
     for values in _ARC_RE.findall(target):
         start = (float(values[0]), float(values[1]))
@@ -2560,6 +2579,7 @@ def _add_symbol_primitive_points(
             _arc_extent_points(start, mid, end),
             origin,
             rotation,
+            mirror,
         )
     _place_rotated_points(
         xs,
@@ -2567,6 +2587,7 @@ def _add_symbol_primitive_points(
         ((float(px), float(py)) for px, py, _ in _PIN_AT_RE.findall(target)),
         origin,
         rotation,
+        mirror,
     )
 
 
@@ -2577,6 +2598,7 @@ def get_symbol_primitive_bounds(
     sym_y: float,
     rotation: int = 0,
     unit: int = 1,
+    mirror: str = "",
 ) -> tuple[float, float, float, float] | None:
     """Extent of a placed symbol from its library primitives.
 
@@ -2587,8 +2609,7 @@ def get_symbol_primitive_bounds(
     if sym_file is None:
         return None
 
-    content = sym_file.read_text(encoding="utf-8", errors="ignore")
-    blocks = _collect_symbol_blocks(content, symbol_name)
+    blocks = _load_symbol_blocks(sym_file, symbol_name)
     if not blocks:
         return None
 
@@ -2610,7 +2631,7 @@ def get_symbol_primitive_bounds(
 
         origin = (sym_x, sym_y)
         for target in target_blocks:
-            _add_symbol_primitive_points(xs, ys, target, origin, rotation)
+            _add_symbol_primitive_points(xs, ys, target, origin, rotation, mirror)
 
     if not xs or not ys:
         return None
@@ -2797,10 +2818,11 @@ def _placed_symbol_bbox(symbol: dict[str, Any]) -> BBox:
     lib_id = str(symbol.get("lib_id", "") or "")
     rotation = int(round(float(symbol.get("rotation", 0.0) or 0.0)))
     unit = int(symbol.get("unit", 1) or 1)
+    mirror = str(symbol.get("mirror", "") or "")
     bounds = None
     if lib_id and ":" in lib_id:
         library, symbol_name = _split_lib_id(lib_id)
-        bounds = get_symbol_primitive_bounds(library, symbol_name, x, y, rotation, unit)
+        bounds = get_symbol_primitive_bounds(library, symbol_name, x, y, rotation, unit, mirror)
     return BBox(*(bounds if bounds is not None else _symbol_bbox_bounds(symbol)))
 
 
@@ -2808,14 +2830,17 @@ def _get_symbol_bboxes(sexpr_content: str) -> list[BBox]:
     symbols: list[dict[str, Any]] = []
     cursor = 0
     while cursor < len(sexpr_content):
-        if sexpr_content[cursor:].startswith("(symbol"):
-            block, length = _extract_block(sexpr_content, cursor)
-            if block:
-                parsed = _parse_symbol_block(block)
-                if parsed is not None:
-                    symbols.append(parsed)
-                cursor += length
-                continue
+        idx = sexpr_content.find("(symbol", cursor)
+        if idx < 0:
+            break
+        cursor = idx
+        block, length = _extract_block(sexpr_content, cursor)
+        if block:
+            parsed = _parse_symbol_block(block)
+            if parsed is not None:
+                symbols.append(parsed)
+            cursor += length
+            continue
         cursor += 1
     bboxes = [_placed_symbol_bbox(symbol) for symbol in symbols]
     # Hierarchical sheets occupy space too: a wire crossing one is as wrong as a
@@ -2830,20 +2855,114 @@ def _remove_wire_blocks(content: str) -> str:
     cursor = 0
     last = 0
     while cursor < len(content):
-        if content[cursor:].startswith("(wire"):
-            block, length = _extract_block(content, cursor)
-            if block and _parse_wire_block(block) is not None:
-                pieces.append(content[last:cursor])
-                cursor += length
-                last = cursor
-                continue
+        idx = content.find("(wire", cursor)
+        if idx < 0:
+            break
+        cursor = idx
+        block, length = _extract_block(content, cursor)
+        if block and _parse_wire_block(block) is not None:
+            pieces.append(content[last:cursor])
+            cursor += length
+            last = cursor
+            continue
         cursor += 1
     pieces.append(content[last:])
     return "".join(pieces)
 
 
+def _extend_impaled_port_labels(content: str, stub_mm: float = 5.08) -> str:
+    """Slide any global_label/hierarchical_label impaled by its own horizontal wire to the outer bus end."""
+    wires = _extract_wires(content)
+    if not wires:
+        return content
+    tol = SNAP_TOLERANCE_MM
+    impaled: list[tuple[int, int, str, dict[str, Any], str, float]] = []
+    for m in re.finditer(r"\((?:global_label|hierarchical_label)\b", content):
+        blk, length = _extract_block(content, m.start())
+        if not blk:
+            continue
+        parsed = _parse_label_block(blk)
+        if not parsed:
+            continue
+        lx = float(parsed["x"])
+        ly = float(parsed["y"])
+        rot = int(parsed["rotation"]) % 360
+        if rot == 0:
+            far_xs = [
+                max(float(w["x1"]), float(w["x2"]))
+                for w in wires
+                if abs(float(w["y1"]) - ly) <= tol
+                and abs(float(w["y2"]) - ly) <= tol
+                and min(float(w["x1"]), float(w["x2"])) <= lx + tol
+                and max(float(w["x1"]), float(w["x2"])) > lx + tol
+            ]
+            if far_xs:
+                impaled.append((m.start(), m.start() + length, blk, parsed, "right", max(far_xs)))
+        elif rot == 180:
+            far_xs = [
+                min(float(w["x1"]), float(w["x2"]))
+                for w in wires
+                if abs(float(w["y1"]) - ly) <= tol
+                and abs(float(w["y2"]) - ly) <= tol
+                and max(float(w["x1"]), float(w["x2"])) >= lx - tol
+                and min(float(w["x1"]), float(w["x2"])) < lx - tol
+            ]
+            if far_xs:
+                impaled.append((m.start(), m.start() + length, blk, parsed, "left", min(far_xs)))
+    if not impaled:
+        return content
+
+    right_max = max((fx for _, _, _, _, d, fx in impaled if d == "right"), default=None)
+    left_min = min((fx for _, _, _, _, d, fx in impaled if d == "left"), default=None)
+    vert_wires = [
+        (float(w["x1"]), min(float(w["y1"]), float(w["y2"])), max(float(w["y1"]), float(w["y2"])))
+        for w in wires
+        if abs(float(w["x1"]) - float(w["x2"])) <= tol
+        and abs(float(w["y1"]) - float(w["y2"])) > tol
+    ]
+    new_wires: list[str] = []
+    updated = content
+    for start, end, blk, parsed, direction, far_x in reversed(impaled):
+        ly = float(parsed["y"])
+        if direction == "right" and right_max is not None:
+            target_x = round(right_max + stub_mm, 4)
+            # If extending from far_x to target_x would cross a vertical wire, stop at far_x + 3.81 mm
+            if any(
+                far_x + tol < vx < target_x + tol and vy_min - tol < ly < vy_max + tol
+                for vx, vy_min, vy_max in vert_wires
+            ):
+                target_x = round(far_x + 3.81, 4)
+            new_blk = re.sub(
+                r"\(at\s+[-\d.]+\s+[-\d.]+\s+([-\d.]+)\)",
+                f"(at {_fmt_mm(target_x)} {_fmt_mm(ly)} \\1)",
+                blk,
+                count=1,
+            )
+            updated = updated[:start] + new_blk + updated[end:]
+            new_wires.append(wire_block(far_x, ly, target_x, ly))
+        elif direction == "left" and left_min is not None:
+            target_x = round(left_min - stub_mm, 4)
+            if any(
+                target_x - tol < vx < far_x - tol and vy_min - tol < ly < vy_max + tol
+                for vx, vy_min, vy_max in vert_wires
+            ):
+                target_x = round(far_x - 3.81, 4)
+            new_blk = re.sub(
+                r"\(at\s+[-\d.]+\s+[-\d.]+\s+([-\d.]+)\)",
+                f"(at {_fmt_mm(target_x)} {_fmt_mm(ly)} \\1)",
+                blk,
+                count=1,
+            )
+            updated = updated[:start] + new_blk + updated[end:]
+            new_wires.append(wire_block(target_x, ly, far_x, ly))
+    for w_blk in new_wires:
+        updated = _append_before_sheet_instances(updated, w_blk)
+    return updated
+
+
 def _normalize_schematic_wire_connectivity(content: str) -> str:
     """Normalize exact wire duplicates without merging KiCad-authored runs."""
+    content = _extend_impaled_port_labels(content)
     wires = _extract_wires(content)
     segments = _wire_segments_from_content(content)
     deduped: list[tuple[float, float, float, float]] = []
@@ -2943,14 +3062,17 @@ def _schematic_object_map(content: str) -> dict[str, dict[str, Any]]:
 
     cursor = 0
     while cursor < len(content):
-        if content[cursor:].startswith("(symbol"):
-            block, length = _extract_block(content, cursor)
-            if block:
-                parsed = _parse_symbol_block(block)
-                if parsed is not None:
-                    records.append({"kind": "symbol", **parsed})
-                cursor += length
-                continue
+        idx = content.find("(symbol", cursor)
+        if idx < 0:
+            break
+        cursor = idx
+        block, length = _extract_block(content, cursor)
+        if block:
+            parsed = _parse_symbol_block(block)
+            if parsed is not None:
+                records.append({"kind": "symbol", **parsed})
+            cursor += length
+            continue
         cursor += 1
 
     for match in re.finditer(r"\((?:label|global_label|hierarchical_label)\b", content):
@@ -3429,6 +3551,25 @@ def _find_symbol_extends(block: str) -> str | None:
     return match.group(1) if match else None
 
 
+@functools.lru_cache(maxsize=512)
+def _cached_library_content(sym_file_str: str, mtime_ns: int) -> str:
+    return Path(sym_file_str).read_text(encoding="utf-8", errors="ignore")
+
+
+@functools.lru_cache(maxsize=1024)
+def _cached_symbol_blocks(sym_file_str: str, mtime_ns: int, symbol_name: str) -> tuple[str, ...]:
+    content = _cached_library_content(sym_file_str, mtime_ns)
+    return tuple(_collect_symbol_blocks(content, symbol_name))
+
+
+def _load_symbol_blocks(sym_file: Path, symbol_name: str) -> list[str]:
+    try:
+        mtime_ns = sym_file.stat().st_mtime_ns
+    except OSError:
+        return []
+    return list(_cached_symbol_blocks(str(sym_file), mtime_ns, symbol_name))
+
+
 def _collect_symbol_blocks(
     content: str,
     symbol_name: str,
@@ -3647,8 +3788,7 @@ def get_pin_positions(
     if sym_file is None:
         return {}
 
-    content = sym_file.read_text(encoding="utf-8", errors="ignore")
-    blocks = _collect_symbol_blocks(content, symbol_name)
+    blocks = _load_symbol_blocks(sym_file, symbol_name)
     if not blocks:
         return {}
     available_units = _available_units_from_blocks(blocks)
@@ -3985,16 +4125,22 @@ def _point_on_segment_midpoint(
 def _detect_t_intersections(
     wires: list[tuple[float, float, float, float]],
 ) -> list[tuple[float, float]]:
-    """Return wire endpoints that land on another wire's interior."""
+    """Return wire endpoints that land on another wire's interior or where >=3 wire endpoints meet."""
     junctions: set[tuple[float, float]] = set()
+    endpoint_counts: dict[tuple[float, float], int] = {}
     for index, segment in enumerate(wires):
         endpoints = ((segment[0], segment[1]), (segment[2], segment[3]))
         for point in endpoints:
+            key = _coord_pair_key(point[0], point[1])
+            endpoint_counts[key] = endpoint_counts.get(key, 0) + 1
             if any(
                 other_index != index and _point_on_segment_midpoint(point, other)
                 for other_index, other in enumerate(wires)
             ):
-                junctions.add(_coord_pair_key(point[0], point[1]))
+                junctions.add(key)
+    for key, count in endpoint_counts.items():
+        if count >= 3:
+            junctions.add(key)
     return sorted(junctions)
 
 
@@ -4215,8 +4361,7 @@ def get_pin_outward_normals(
     if sym_file is None:
         return {}
 
-    content = sym_file.read_text(encoding="utf-8", errors="ignore")
-    blocks = _collect_symbol_blocks(content, symbol_name)
+    blocks = _load_symbol_blocks(sym_file, symbol_name)
     if not blocks:
         return {}
     available_units = _available_units_from_blocks(blocks)
@@ -4351,16 +4496,67 @@ def _net_wire_segments(
     return [wires[index] for index in sorted(seen)]
 
 
+def _foreign_pin_escape_stubs(
+    content: str,
+    anchors: list[tuple[float, float]],
+    own_wires: list[tuple[float, float, float, float]],
+) -> list[tuple[float, float, float, float]]:
+    """Reserve the 1-grid outward escape stub of every placed symbol pin not on the active net."""
+    stubs: list[tuple[float, float, float, float]] = []
+    tol = SNAP_TOLERANCE_MM
+    cursor = 0
+    while cursor < len(content):
+        idx = content.find("(symbol", cursor)
+        if idx < 0:
+            break
+        cursor = idx
+        block, length = _extract_block(content, cursor)
+        if block:
+            parsed = _parse_symbol_block(block)
+            if parsed is not None:
+                lib_id = str(parsed.get("lib_id", ""))
+                if ":" in lib_id:
+                    lib, sname = _split_lib_id(lib_id)
+                    sx = float(parsed.get("x", 0.0) or 0.0)
+                    sy = float(parsed.get("y", 0.0) or 0.0)
+                    rot = int(parsed.get("rotation", 0) or 0)
+                    unit = int(parsed.get("unit", 1) or 1)
+                    mir = str(parsed.get("mirror", "") or "")
+                    ppos = get_pin_positions(lib, sname, sx, sy, rot, unit, mir)
+                    pnorm = get_pin_outward_normals(lib, sname, rot, unit, mir)
+                    for pnum, pt in ppos.items():
+                        if any(
+                            abs(pt[0] - ax) <= tol and abs(pt[1] - ay) <= tol
+                            for ax, ay in anchors
+                        ):
+                            continue
+                        if any(point_on_segment(pt, seg) for seg in own_wires):
+                            continue
+                        step = _grid_step(pnorm.get(pnum))
+                        if step is not None:
+                            stubs.append((
+                                round(pt[0] - 2.0 * SCHEMATIC_GRID_MM * step[0], 4),
+                                round(pt[1] - 2.0 * SCHEMATIC_GRID_MM * step[1], 4),
+                                round(pt[0] + SCHEMATIC_GRID_MM * step[0], 4),
+                                round(pt[1] + SCHEMATIC_GRID_MM * step[1], 4),
+                            ))
+            cursor += length
+            continue
+        cursor += 1
+    return stubs
+
+
 def _foreign_wire_segments(
     content: str,
     anchors: list[tuple[float, float]],
 ) -> list[tuple[float, float, float, float]]:
-    """Existing wires that belong to a different net than the anchored one."""
+    """Existing wires and 1-grid pin escape stubs that belong to a different net than the anchored one."""
     wires = _wire_segments_from_content(content)
-    if not wires:
-        return []
-    own = {_segment_key(segment) for segment in _net_wire_segments(wires, anchors)}
-    return [segment for segment in wires if _segment_key(segment) not in own]
+    own_list = _net_wire_segments(wires, anchors) if wires else []
+    own = {_segment_key(segment) for segment in own_list}
+    foreign = [segment for segment in wires if _segment_key(segment) not in own]
+    foreign.extend(_foreign_pin_escape_stubs(content, anchors, own_list))
+    return foreign
 
 
 def _escape_point(
@@ -4528,7 +4724,14 @@ def _route_avoiding_obstacles(
     one whose remaining crossings were unavoidable reports
     ``net_crossing_unavoidable``.
     """
-    direct = _deduplicate_segments(_manhattan_segments(start, end, snap_to_grid))
+    x1, y1, x2, y2 = _snap_line(start[0], start[1], end[0], end[1], snap_to_grid)
+    raw_hv = _manhattan_segments(start, end, snap_to_grid)
+    raw_vh = (
+        [(x1, y1, x1, y2), (x1, y2, x2, y2)]
+        if abs(x1 - x2) > SNAP_TOLERANCE_MM and abs(y1 - y2) > SNAP_TOLERANCE_MM
+        else raw_hv
+    )
+    direct = _deduplicate_segments(raw_hv)
 
     grid = SCHEMATIC_GRID_MM
     boundary_edges = _module_boundary_edges(boundaries)
@@ -4540,18 +4743,20 @@ def _route_avoiding_obstacles(
     # The direct run is taken only when it is clean on every axis.  If it merely
     # crosses another net, A* gets to trade length and bends against that
     # crossing: a longer run with fewer crossings is the better schematic.
-    if (
-        direct
-        and not _route_hits_keepouts(direct, obstacles, owners)
-        and not _route_merges_with_occupied(direct, occupied)
-        and not _net_crossings(direct, occupied)
-        and not _route_avoids_pin_hinge(direct, start_normal, end_normal)
-        and not any(
-            hugs_boundary(segment, boundary_edges, SchematicRouter.BOUNDARY_CLEARANCE * grid)
-            for segment in direct
-        )
-    ):
-        return direct, None
+    for raw_candidate in (raw_hv, raw_vh):
+        candidate = _deduplicate_segments(raw_candidate)
+        if (
+            candidate
+            and not _route_hits_keepouts(candidate, obstacles, owners)
+            and not _route_merges_with_occupied(candidate, occupied)
+            and not _net_crossings(candidate, occupied)
+            and not _route_avoids_pin_hinge(raw_candidate, start_normal, end_normal)
+            and not any(
+                hugs_boundary(segment, boundary_edges, SchematicRouter.BOUNDARY_CLEARANCE * grid)
+                for segment in candidate
+            )
+        ):
+            return candidate, None
 
     # The escape landing is snapped onto the router's own lattice, because that
     # is the only place a stitched stub can meet the run.  Off-grid here is an
@@ -4570,13 +4775,31 @@ def _route_avoiding_obstacles(
     )
     end_esc = _router_grid_node(end_landing, grid)
 
+    router_occupied = list(occupied or [])
+    start_step = _grid_step(start_normal)
+    if start_step is not None and start_esc != start:
+        router_occupied.append((
+            round(start[0] - 2.0 * grid * start_step[0], 4),
+            round(start[1] - 2.0 * grid * start_step[1], 4),
+            start[0],
+            start[1],
+        ))
+    end_step = _grid_step(end_normal)
+    if end_step is not None and end_esc != end:
+        router_occupied.append((
+            round(end[0] - 2.0 * grid * end_step[0], 4),
+            round(end[1] - 2.0 * grid * end_step[1], 4),
+            end[0],
+            end[1],
+        ))
+
     router = SchematicRouter(
         grid_mm=grid,
         obstacles=[
             RouterBBox(obstacle.x_min, obstacle.y_min, obstacle.x_max, obstacle.y_max)
             for obstacle in obstacles
         ],
-        occupied=list(occupied or []),
+        occupied=router_occupied,
         boundaries=[
             RouterBBox(boundary.x_min, boundary.y_min, boundary.x_max, boundary.y_max)
             for boundary in boundaries or []
@@ -5667,7 +5890,7 @@ def label_block(
         f"\t({effective_kind} {_sexpr_string(name)}\n"
         f"{shape_line}"
         f"\t\t(at {_fmt_mm(x)} {_fmt_mm(y)} {rotation})\n"
-        f"\t\t(effects (font (size 1.524 1.524)){justify_part})\n"
+        f"\t\t(effects (font (size 1.27 1.27)){justify_part})\n"
         f'\t\t(uuid "{new_uuid()}")\n'
         "\t)"
     )
@@ -5709,6 +5932,7 @@ def place_symbol_block(
     project_name: str = "KiCadMCP",
     root_uuid: str = "",
     properties: dict[str, str] | None = None,
+    mirror: str = "",
 ) -> str:
     """Build a schematic symbol instance block.
 
@@ -5745,10 +5969,12 @@ def place_symbol_block(
             "\t\t)\n"
         )
     extra_properties = "".join(extra_property_blocks)
+    mirror_line = f"\t\t(mirror {mirror})\n" if mirror in ("x", "y") else ""
     return (
         "\t(symbol\n"
         f"\t\t(lib_id {_sexpr_string(lib_id)})\n"
         f"\t\t(at {_fmt_mm(x)} {_fmt_mm(y)} {rotation})\n"
+        f"{mirror_line}"
         f"\t\t(unit {unit})\n"
         "\t\t(exclude_from_sim no)\n"
         "\t\t(in_bom yes)\n"
@@ -5882,14 +6108,17 @@ def _find_placed_symbol_blocks(
     matches: list[tuple[str, int, int, dict[str, Any]]] = []
     cursor = 0
     while cursor < len(content):
-        if content[cursor:].startswith("(symbol"):
-            block, length = _extract_block(content, cursor)
-            if block:
-                parsed = _parse_symbol_block(block)
-                if parsed is not None and parsed["reference"] == reference:
-                    matches.append((block, cursor, cursor + length, parsed))
-                cursor += length
-                continue
+        idx = content.find("(symbol", cursor)
+        if idx < 0:
+            break
+        cursor = idx
+        block, length = _extract_block(content, cursor)
+        if block:
+            parsed = _parse_symbol_block(block)
+            if parsed is not None and parsed["reference"] == reference:
+                matches.append((block, cursor, cursor + length, parsed))
+            cursor += length
+            continue
         cursor += 1
     return matches
 
@@ -6054,13 +6283,15 @@ def _update_symbol_property_block(
     return block[:insert_point] + property_block + block[insert_point:]
 
 
-def _set_property_position(block: str, field: str, x: float, y: float, angle: float) -> str:
-    """Rewrite the ``(at x y angle)`` of a named property inside a symbol block.
-
-    Returns the block unchanged when the property (or its ``at``) is absent, so
-    callers can apply this defensively. Only the property's own ``at`` is touched
-    — the symbol's placement ``at`` and any nested effects are left intact.
-    """
+def _set_property_position(
+    block: str,
+    field: str,
+    x: float,
+    y: float,
+    angle: float,
+    justify: frozenset[str] | None = None,
+) -> str:
+    """Rewrite the ``(at x y angle)`` and optional ``(justify ...)`` of a named property."""
     marker = f'(property "{field}"'
     idx = block.find(marker)
     if idx < 0:
@@ -6073,6 +6304,17 @@ def _set_property_position(block: str, field: str, x: float, y: float, angle: fl
         return block
     new_at = f"(at {_fmt_mm(x)} {_fmt_mm(y)} {int(round(angle))})"
     new_prop = at_pattern.sub(new_at, prop_block, count=1)
+    if justify is not None:
+        new_prop = re.sub(r"\s*\(justify\s+[^)]+\)", "", new_prop)
+        tokens = [t for t in ("left", "right", "top", "bottom") if t in justify]
+        if tokens:
+            just_expr = f" (justify {' '.join(tokens)})"
+            new_prop = re.sub(
+                r"(\(effects\s+\(font\s+\(size\s+[^)]+\)\))",
+                rf"\1{just_expr}",
+                new_prop,
+                count=1,
+            )
     return block[:idx] + new_prop + block[idx + length :]
 
 
@@ -6081,22 +6323,37 @@ def _symbol_body_and_pins(parsed: dict[str, Any]) -> tuple[GeoBox, list[tuple[fl
     x = float(parsed.get("x", 0.0) or 0.0)
     y = float(parsed.get("y", 0.0) or 0.0)
     pin_points: list[tuple[float, float]] = []
+    prim_bounds: tuple[float, float, float, float] | None = None
     lib_id = str(parsed.get("lib_id", "") or "")
     if lib_id:
         try:
             library, symbol_name = _split_lib_id(lib_id)
+            rot = int(parsed.get("rotation", 0) or 0)
+            unit = int(parsed.get("unit", 1) or 1)
+            mirror = str(parsed.get("mirror", "") or "")
             pins = get_pin_positions(
                 library=library,
                 symbol_name=symbol_name,
                 sym_x=x,
                 sym_y=y,
-                rotation=int(parsed.get("rotation", 0) or 0),
-                unit=int(parsed.get("unit", 1) or 1),
+                rotation=rot,
+                unit=unit,
+                mirror=mirror,
             )
             pin_points = list(pins.values())
+            prim_bounds = get_symbol_primitive_bounds(
+                library, symbol_name, x, y, rot, unit, mirror
+            )
         except (FileNotFoundError, OSError, ValueError) as exc:
             logger.debug("autoplace_fields_pin_lookup_failed", lib_id=lib_id, error=str(exc))
     body = body_box_from_pins(pin_points, center=(x, y))
+    if prim_bounds is not None:
+        body = GeoBox(
+            min(body.x_min, prim_bounds[0]),
+            min(body.y_min, prim_bounds[1]),
+            max(body.x_max, prim_bounds[2]),
+            max(body.y_max, prim_bounds[3]),
+        )
     return body, pin_points
 
 
@@ -6110,7 +6367,9 @@ def _build_autoplace_fields_mutator(
     is appended to as the mutator runs so callers can report what changed. Shared
     by the ``sch_autoplace_fields`` tool and the readability fix loop.
     """
-    symbols = parse_schematic_file(sch_file)["symbols"]
+    parsed_sch = parse_schematic_file(sch_file)
+    symbols = parsed_sch["symbols"]
+    wires = parsed_sch.get("wires", [])
     wanted = set(references) if references else None
 
     bodies: dict[str, GeoBox] = {}
@@ -6123,6 +6382,21 @@ def _build_autoplace_fields_mutator(
         bodies[ref] = body
         body_pins[ref] = (body, pins)
 
+    wire_boxes: list[GeoBox] = []
+    for w in wires:
+        x1 = float(w.get("x1", 0.0) or 0.0)
+        y1 = float(w.get("y1", 0.0) or 0.0)
+        x2 = float(w.get("x2", 0.0) or 0.0)
+        y2 = float(w.get("y2", 0.0) or 0.0)
+        wire_boxes.append(
+            GeoBox(
+                min(x1, x2) - 0.25,
+                min(y1, y2) - 0.25,
+                max(x1, x2) + 0.25,
+                max(y1, y2) + 0.25,
+            )
+        )
+
     targets = [
         str(s.get("reference", ""))
         for s in symbols
@@ -6131,25 +6405,61 @@ def _build_autoplace_fields_mutator(
     updated: list[str] = []
 
     def mutator(content: str) -> str:
+        from ..models.visual_qa import parse_labels, parse_placed_symbols
+
         new_content = content
+        label_boxes = [lbl.box() for lbl in parse_labels(new_content)]
+        power_boxes: list[GeoBox] = []
+        for ps in parse_placed_symbols(new_content):
+            if ps.reference.startswith("#") or ps.lib_id.startswith("power:"):
+                power_boxes.append(ps.body)
+                power_boxes.extend(f.box() for f in ps.fields if f.text)
+        placed_field_boxes: list[GeoBox] = []
+
         for ref in targets:
             match = _find_placed_symbol_block(new_content, ref)
             if match is None:
                 continue
             block, start, end, parsed = match
             body, pins = body_pins.get(ref, _symbol_body_and_pins(parsed))
-            obstacles = [b for other, b in bodies.items() if other != ref]
+            obstacles = (
+                [b for other, b in bodies.items() if other != ref]
+                + wire_boxes
+                + label_boxes
+                + power_boxes
+                + placed_field_boxes
+            )
             specs = [
                 FieldSpec("Reference", str(parsed.get("reference", ""))),
                 FieldSpec("Value", str(parsed.get("value", ""))),
             ]
             placements = autoplace_fields(body, pins, obstacles, specs)
+            sym_rot = int(parsed.get("rotation", 0) or 0) % 360
             new_block = block
             for spec, placement in zip(specs, placements, strict=True):
                 if not spec.text:
                     continue
+                placed_field_boxes.append(
+                    placement.text_field(spec.text, spec.font_mm, bold=spec.bold).box()
+                )
+                sexpr_angle = (int(round(placement.angle)) + sym_rot) % 180
+                sexpr_justify = placement.justify
+                if sym_rot in (90, 180) and ("left" in sexpr_justify or "right" in sexpr_justify):
+                    flipped = set(sexpr_justify)
+                    if "left" in flipped:
+                        flipped.remove("left")
+                        flipped.add("right")
+                    elif "right" in flipped:
+                        flipped.remove("right")
+                        flipped.add("left")
+                    sexpr_justify = frozenset(flipped)
                 new_block = _set_property_position(
-                    new_block, spec.name, placement.x, placement.y, placement.angle
+                    new_block,
+                    spec.name,
+                    placement.x,
+                    placement.y,
+                    sexpr_angle,
+                    sexpr_justify,
                 )
             if new_block != block:
                 new_content = new_content[:start] + new_block + new_content[end:]
@@ -6397,14 +6707,17 @@ def _find_all_placed_symbol_blocks(
     matches: list[tuple[str, int, int, dict[str, Any]]] = []
     cursor = 0
     while cursor < len(content):
-        if content[cursor:].startswith("(symbol"):
-            block, length = _extract_block(content, cursor)
-            if block:
-                parsed = _parse_symbol_block(block)
-                if parsed is not None:
-                    matches.append((block, cursor, cursor + length, parsed))
-                cursor += length
-                continue
+        idx = content.find("(symbol", cursor)
+        if idx < 0:
+            break
+        cursor = idx
+        block, length = _extract_block(content, cursor)
+        if block:
+            parsed = _parse_symbol_block(block)
+            if parsed is not None:
+                matches.append((block, cursor, cursor + length, parsed))
+            cursor += length
+            continue
         cursor += 1
     return matches
 
@@ -6720,6 +7033,208 @@ def _connectivity_module_boundaries(content: str) -> list[BoundingBoxLike]:
 
 def _connectivity_symbol_bboxes(content: str) -> list[BoundingBoxLike]:
     return cast(list[BoundingBoxLike], _get_symbol_bboxes(content))
+
+
+def _first_same_net_hit(
+    seg: tuple[float, float, float, float],
+    net_wires: list[tuple[float, float, float, float]],
+    origin: tuple[float, float],
+) -> tuple[float, float] | None:
+    """Return the first point along ``seg`` that intersects ``net_wires`` away from ``origin``."""
+    x1, y1, x2, y2 = seg
+    tol = SNAP_TOLERANCE_MM
+    seg_horiz = abs(y1 - y2) <= tol
+    seg_vert = abs(x1 - x2) <= tol
+    candidates: list[tuple[float, tuple[float, float]]] = []
+    for wx1, wy1, wx2, wy2 in net_wires:
+        w_horiz = abs(wy1 - wy2) <= tol
+        w_vert = abs(wx1 - wx2) <= tol
+        hit: tuple[float, float] | None = None
+        if seg_horiz and w_vert:
+            if (
+                min(x1, x2) - tol <= wx1 <= max(x1, x2) + tol
+                and min(wy1, wy2) - tol <= y1 <= max(wy1, wy2) + tol
+            ):
+                hit = (wx1, y1)
+        elif seg_vert and w_horiz:
+            if (
+                min(y1, y2) - tol <= wy1 <= max(y1, y2) + tol
+                and min(wx1, wx2) - tol <= x1 <= max(wx1, wx2) + tol
+            ):
+                hit = (x1, wy1)
+        elif seg_horiz and w_horiz and abs(y1 - wy1) <= tol:
+            lo = max(min(x1, x2), min(wx1, wx2))
+            hi = min(max(x1, x2), max(wx1, wx2))
+            if lo <= hi + tol:
+                hx = lo if x2 >= x1 else hi
+                hit = (hx, y1)
+        elif seg_vert and w_vert and abs(x1 - wx1) <= tol:
+            lo = max(min(y1, y2), min(wy1, wy2))
+            hi = min(max(y1, y2), max(wy1, wy2))
+            if lo <= hi + tol:
+                hy = lo if y2 >= y1 else hi
+                hit = (x1, hy)
+        if hit is not None:
+            if abs(hit[0] - origin[0]) <= tol and abs(hit[1] - origin[1]) <= tol:
+                continue
+            dist = abs(hit[0] - x1) + abs(hit[1] - y1)
+            candidates.append((dist, hit))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0])
+    return candidates[0][1]
+
+
+def _order_polyline_from(
+    segments: list[tuple[float, float, float, float]],
+    origin: tuple[float, float],
+) -> list[tuple[float, float, float, float]] | None:
+    """Order a simple chain of segments into a directed walk starting at ``origin``."""
+    remaining = list(segments)
+    ordered: list[tuple[float, float, float, float]] = []
+    cur = origin
+    tol = SNAP_TOLERANCE_MM
+    while remaining:
+        matched_idx: int | None = None
+        directed_seg: tuple[float, float, float, float] | None = None
+        for idx, (x1, y1, x2, y2) in enumerate(remaining):
+            if abs(x1 - cur[0]) <= tol and abs(y1 - cur[1]) <= tol:
+                matched_idx = idx
+                directed_seg = (x1, y1, x2, y2)
+                cur = (x2, y2)
+                break
+            if abs(x2 - cur[0]) <= tol and abs(y2 - cur[1]) <= tol:
+                matched_idx = idx
+                directed_seg = (x2, y2, x1, y1)
+                cur = (x1, y1)
+                break
+        if matched_idx is None or directed_seg is None:
+            return None
+        ordered.append(directed_seg)
+        remaining.pop(matched_idx)
+    return ordered
+
+
+def _advance_to_existing_stem_junction(
+    content: str,
+    pin: tuple[float, float],
+    normal: tuple[float, float] | None,
+) -> tuple[tuple[float, float], tuple[float, float] | None]:
+    """If ``pin`` already has an outward wire stem meeting a perpendicular trunk, start at that junction."""
+    if normal is None:
+        return pin, normal
+    step = _grid_step(normal)
+    if step is None:
+        return pin, normal
+    wires = _wire_segments_from_content(content)
+    if not wires:
+        return pin, normal
+    net_wires = _net_wire_segments(wires, [pin])
+    if not net_wires:
+        return pin, normal
+
+    tol = SNAP_TOLERANCE_MM
+    px, py = pin
+    dx, dy = step
+    ray_end_x, ray_end_y = px, py
+    changed = True
+    while changed:
+        changed = False
+        for x1, y1, x2, y2 in net_wires:
+            if dx != 0 and abs(y1 - py) <= tol and abs(y2 - py) <= tol:
+                lo, hi = min(x1, x2), max(x1, x2)
+                if dx > 0 and lo - tol <= ray_end_x < hi - tol:
+                    ray_end_x = hi
+                    changed = True
+                elif dx < 0 and lo + tol < ray_end_x <= hi + tol:
+                    ray_end_x = lo
+                    changed = True
+            elif dy != 0 and abs(x1 - px) <= tol and abs(x2 - px) <= tol:
+                lo, hi = min(y1, y2), max(y1, y2)
+                if dy > 0 and lo - tol <= ray_end_y < hi - tol:
+                    ray_end_y = hi
+                    changed = True
+                elif dy < 0 and lo + tol < ray_end_y <= hi + tol:
+                    ray_end_y = lo
+                    changed = True
+
+    if abs(ray_end_x - px) <= tol and abs(ray_end_y - py) <= tol:
+        return pin, normal
+
+    perp_hits: list[tuple[float, tuple[float, float]]] = []
+    for x1, y1, x2, y2 in net_wires:
+        if dx != 0 and abs(x1 - x2) <= tol:
+            ray_lo, ray_hi = min(px, ray_end_x), max(px, ray_end_x)
+            seg_lo, seg_hi = min(y1, y2), max(y1, y2)
+            if (
+                ray_lo - tol <= x1 <= ray_hi + tol
+                and abs(x1 - px) > tol
+                and seg_lo - tol <= py <= seg_hi + tol
+            ):
+                perp_hits.append((abs(x1 - px), (x1, py)))
+        elif dy != 0 and abs(y1 - y2) <= tol:
+            ray_lo, ray_hi = min(py, ray_end_y), max(py, ray_end_y)
+            seg_lo, seg_hi = min(x1, x2), max(x1, x2)
+            if (
+                ray_lo - tol <= y1 <= ray_hi + tol
+                and abs(y1 - py) > tol
+                and seg_lo - tol <= px <= seg_hi + tol
+            ):
+                perp_hits.append((abs(y1 - py), (px, y1)))
+
+    if perp_hits:
+        perp_hits.sort(key=lambda item: item[0])
+        return perp_hits[0][1], None
+
+    return pin, normal
+
+
+def _truncate_route_at_same_net_tap(
+    content: str,
+    start: tuple[float, float],
+    end: tuple[float, float],
+    segments: list[tuple[float, float, float, float]],
+) -> list[tuple[float, float, float, float]]:
+    """Truncate a multi-pin net route where it first taps into an existing same-net wire."""
+    wires = _wire_segments_from_content(content)
+    if not wires or not segments:
+        return segments
+    start_net = _net_wire_segments(wires, [start])
+    end_net = _net_wire_segments(wires, [end])
+    if start_net and end_net:
+        start_keys = {_segment_key(w) for w in start_net}
+        if any(_segment_key(w) in start_keys for w in end_net):
+            return segments
+
+    tol = SNAP_TOLERANCE_MM
+    result = list(segments)
+    if end_net:
+        walk_from_start = _order_polyline_from(result, start)
+        if walk_from_start is not None:
+            for idx, seg in enumerate(walk_from_start):
+                hit = _first_same_net_hit(seg, end_net, start)
+                if hit is not None:
+                    prefix = walk_from_start[:idx]
+                    if abs(hit[0] - seg[0]) > tol or abs(hit[1] - seg[1]) > tol:
+                        prefix.append((seg[0], seg[1], hit[0], hit[1]))
+                    if prefix:
+                        result = _deduplicate_segments(prefix)
+                    break
+
+    if start_net and not end_net:
+        walk_from_end = _order_polyline_from(result, end)
+        if walk_from_end is not None:
+            for idx, seg in enumerate(walk_from_end):
+                hit = _first_same_net_hit(seg, start_net, end)
+                if hit is not None:
+                    prefix = walk_from_end[:idx]
+                    if abs(hit[0] - seg[0]) > tol or abs(hit[1] - seg[1]) > tol:
+                        prefix.append((seg[0], seg[1], hit[0], hit[1]))
+                    if prefix:
+                        result = _deduplicate_segments(prefix)
+                    break
+
+    return result
 
 
 def _connectivity_foreign_wire_segments(
@@ -7138,6 +7653,8 @@ def _register_authoring(mcp: FastMCP) -> None:
         route_avoiding_obstacles=_connectivity_route_avoiding_obstacles,
         run_auto_add_missing_junctions=run_auto_add_missing_junctions,
         snap_tolerance_mm=SNAP_TOLERANCE_MM,
+        truncate_same_net_tap=_truncate_route_at_same_net_tap,
+        advance_stem_junction=_advance_to_existing_stem_junction,
     )
     schematic_connectivity_authoring.register(
         mcp,
