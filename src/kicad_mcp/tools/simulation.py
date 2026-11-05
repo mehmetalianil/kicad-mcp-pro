@@ -152,6 +152,81 @@ def _format_operating_point(result: SimulationResult) -> str:
     return "\n".join(lines)
 
 
+def _estimate_transient_frequency_and_duty(
+    x_values: list[float],
+    y_values: list[float],
+) -> tuple[float | None, float | None]:
+    """Estimate oscillation frequency and duty cycle from the second half of a transient trace."""
+    n = len(x_values)
+    if n < 20 or len(y_values) != n:
+        return None, None
+    start_idx = n // 3
+    xs = x_values[start_idx:]
+    ys = y_values[start_idx:]
+    y_min = min(ys)
+    y_max = max(ys)
+    swing = y_max - y_min
+    if swing < 1e-4:
+        return None, None
+    mid = 0.5 * (y_min + y_max)
+    rising_crossings: list[float] = []
+    falling_crossings: list[float] = []
+    for i in range(1, len(ys)):
+        y0, y1 = ys[i - 1], ys[i]
+        x0, x1 = xs[i - 1], xs[i]
+        if y0 < mid <= y1 and y1 > y0:
+            frac = (mid - y0) / (y1 - y0)
+            rising_crossings.append(x0 + frac * (x1 - x0))
+        elif y0 >= mid > y1 and y0 > y1:
+            frac = (y0 - mid) / (y0 - y1)
+            falling_crossings.append(x0 + frac * (x1 - x0))
+    if len(rising_crossings) < 2:
+        return None, None
+    periods = [
+        rising_crossings[i] - rising_crossings[i - 1]
+        for i in range(1, len(rising_crossings))
+        if rising_crossings[i] > rising_crossings[i - 1]
+    ]
+    if not periods:
+        return None, None
+    avg_period = sum(periods) / len(periods)
+    if avg_period <= 0.0:
+        return None, None
+    freq_hz = 1.0 / avg_period
+    high_times: list[float] = []
+    for t_rise in rising_crossings[:-1]:
+        next_falls = [t_fall for t_fall in falling_crossings if t_fall > t_rise]
+        if next_falls:
+            dt_high = next_falls[0] - t_rise
+            if 0.0 < dt_high < avg_period:
+                high_times.append(dt_high / avg_period * 100.0)
+    duty_pct = (sum(high_times) / len(high_times)) if high_times else None
+    return freq_hz, duty_pct
+
+
+def _estimate_ac_3db_frequency(
+    x_values: list[float],
+    mag_values: list[float],
+) -> float | None:
+    """Estimate -3 dB cutoff frequency from AC magnitude values."""
+    if len(x_values) < 3 or len(mag_values) != len(x_values):
+        return None
+    peak_mag = max(mag_values)
+    if peak_mag <= 0.0:
+        return None
+    target = peak_mag / math.sqrt(2.0)
+    for i in range(1, len(mag_values)):
+        m0, m1 = mag_values[i - 1], mag_values[i]
+        if (m0 >= target >= m1) or (m0 <= target <= m1):
+            return _interpolate_zero_crossing(
+                x_values[i - 1],
+                x_values[i],
+                m0 - target,
+                m1 - target,
+            )
+    return None
+
+
 def _format_series_result(title: str, result: SimulationResult) -> str:
     lines = _format_result_header(title, result)
     point_count = len(result.x_values)
@@ -167,8 +242,23 @@ def _format_series_result(title: str, result: SimulationResult) -> str:
         first = trace.values[0] if trace.values else 0.0
         last = trace.values[-1] if trace.values else 0.0
         detail = f"- {trace.name}: {first:.6g} -> {last:.6g}"
+        if trace.values:
+            v_min = min(trace.values)
+            v_max = max(trace.values)
+            v_mean = sum(trace.values) / len(trace.values)
+            v_pkpk = v_max - v_min
+            detail += f" (min={v_min:.6g}, max={v_max:.6g}, mean={v_mean:.6g}, pk_pk={v_pkpk:.6g})"
         if trace.phase_values:
             detail += f", phase {trace.phase_values[0]:.3f} -> {trace.phase_values[-1]:.3f} deg"
+            f3db = _estimate_ac_3db_frequency(result.x_values, trace.values)
+            if f3db is not None:
+                detail += f", f_3db={f3db:.6g} Hz"
+        elif result.analysis == "transient" and result.x_values:
+            freq_hz, duty_pct = _estimate_transient_frequency_and_duty(result.x_values, trace.values)
+            if freq_hz is not None:
+                detail += f", freq={freq_hz:.6g} Hz"
+            if duty_pct is not None:
+                detail += f", duty={duty_pct:.2f}%"
         lines.append(detail)
     return "\n".join(lines)
 

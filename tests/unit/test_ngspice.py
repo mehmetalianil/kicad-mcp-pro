@@ -308,6 +308,7 @@ def test_ngspice_runner_cli_builds_and_parses_all_analysis_modes(tmp_path: Path)
     assert "op" in op_deck
     assert "ac dec 10 1.0 1000.0" in ac_deck
     assert "dc V1 0.0 5.0 1.0" in dc_deck
+    assert "set units=degrees" in ac_deck
 
     op = runner._result_from_wrdata(  # noqa: SLF001 - direct parser coverage.
         "operating-point",
@@ -315,8 +316,8 @@ def test_ngspice_runner_cli_builds_and_parses_all_analysis_modes(tmp_path: Path)
         data,
         raw,
         log,
-        ["v(out)", "i(V1)"],
-        [[3.3, -0.01]],
+        ["out", "v(out)", "i(V1)"],
+        [[3.3, 3.3, -0.01]],
     )
     ac = runner._result_from_wrdata(  # noqa: SLF001
         "ac",
@@ -337,6 +338,7 @@ def test_ngspice_runner_cli_builds_and_parses_all_analysis_modes(tmp_path: Path)
         [[0.0, 0.0], [5.0, 4.9]],
     )
 
+    assert len(op.traces) == 2
     assert op.traces[0].name == "out"
     assert op.traces[1].name == "i(V1)"
     assert ac.x_label == "frequency"

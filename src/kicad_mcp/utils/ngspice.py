@@ -230,6 +230,14 @@ def _is_float(token: str) -> bool:
     return True
 
 
+def _format_probe_expr(probe: str, prefix: str = "v") -> str:
+    cleaned = probe.strip()
+    lowered = cleaned.lower()
+    if lowered.startswith(("v(", "i(", "vm(", "vp(", "vdb(", "@")) or "#branch" in lowered:
+        return cleaned
+    return f"{prefix}({cleaned})"
+
+
 class NgspiceRunner:
     """Run simulations through ngspice CLI, using InSpice only when available."""
 
@@ -533,28 +541,30 @@ class NgspiceRunner:
         probe_nets: list[str],
         **kwargs: float | int | str,
     ) -> str:
-        probe_nets = [probe for probe in probe_nets if probe.strip()]
+        probe_nets = [probe.strip() for probe in probe_nets if probe.strip()]
         header_exprs: list[str]
         if analysis == "operating-point":
-            header_exprs = [f"v({probe})" for probe in probe_nets] or ["all"]
+            header_exprs = [_format_probe_expr(probe, "v") for probe in probe_nets] or ["all"]
             analysis_cmd = "op"
         elif analysis == "ac":
-            header_exprs = ["frequency"]
+            header_exprs = []
             for probe in probe_nets:
-                header_exprs.extend([f"vm({probe})", f"vp({probe})"])
+                if probe.lower().startswith(("vm(", "vp(", "vdb(")):
+                    header_exprs.append(probe)
+                else:
+                    bare = _waveform_name(probe)
+                    header_exprs.extend([f"vm({bare})", f"vp({bare})"])
+            if not header_exprs:
+                header_exprs = ["all"]
             analysis_cmd = (
                 f"ac dec {int(kwargs['points_per_decade'])} "
                 f"{float(kwargs['start_freq_hz'])} {float(kwargs['stop_freq_hz'])}"
             )
         elif analysis == "transient":
-            header_exprs = ["time", *[f"v({probe})" for probe in probe_nets]]
+            header_exprs = [_format_probe_expr(probe, "v") for probe in probe_nets] or ["all"]
             analysis_cmd = f"tran {float(kwargs['step_time_s'])} {float(kwargs['stop_time_s'])}"
         elif analysis == "dc":
-            header_exprs = (
-                ["all"]
-                if not probe_nets
-                else ["v(v-sweep)", *[f"v({probe})" for probe in probe_nets]]
-            )
+            header_exprs = [_format_probe_expr(probe, "v") for probe in probe_nets] or ["all"]
             analysis_cmd = (
                 f"dc {kwargs['source_ref']} "
                 f"{float(kwargs['start_v'])} {float(kwargs['stop_v'])} {float(kwargs['step_v'])}"
@@ -574,6 +584,7 @@ class NgspiceRunner:
             "set filetype=ascii\n"
             "set wr_singlescale\n"
             "set wr_vecnames\n"
+            "set units=degrees\n"
             "option numdgt=7\n"
             f"{analysis_cmd}\n"
             f"write '{raw_path_text}' all\n"
@@ -595,9 +606,22 @@ class NgspiceRunner:
     ) -> SimulationResult:
         if analysis == "operating-point":
             first_row = rows[0]
+            # ngspice `set wr_singlescale` prepends the first vector as scale column 0.
+            # Drop column 0 when it duplicates another trace or is a bare node name alongside v(...) columns.
+            cols = list(enumerate(header[: len(first_row)]))
+            if len(cols) >= 2:
+                first_name = _waveform_name(cols[0][1]).lower()
+                rest_names = {_waveform_name(name).lower() for _, name in cols[1:]}
+                has_wrapped_rest = any(
+                    name.lower().startswith(("v(", "i(", "@")) for _, name in cols[1:]
+                )
+                if first_name in rest_names or (
+                    has_wrapped_rest and not cols[0][1].lower().startswith(("v(", "i(", "@"))
+                ):
+                    cols = cols[1:]
             operating_point_traces = [
                 SimulationTrace(name=_waveform_name(name), values=[first_row[index]])
-                for index, name in enumerate(header[: len(first_row)])
+                for index, name in cols
             ]
             return SimulationResult(
                 backend="ngspice-cli",
@@ -613,19 +637,30 @@ class NgspiceRunner:
             x_values = [row[0] for row in rows]
             ac_traces: list[SimulationTrace] = []
             index = 1
-            while index + 1 < len(header):
+            while index < len(header) and header[index].lower() == "frequency":
+                index += 1
+            while index < len(header):
                 magnitude_name = header[index]
-                phase_name = header[index + 1]
                 magnitude_values = [row[index] for row in rows if len(row) > index]
-                phase_values = [row[index + 1] for row in rows if len(row) > index + 1]
-                ac_traces.append(
-                    SimulationTrace(
-                        name=_waveform_name(magnitude_name),
-                        values=magnitude_values,
-                        phase_values=phase_values if phase_name.lower().startswith("vp(") else None,
+                if index + 1 < len(header) and header[index + 1].lower().startswith("vp("):
+                    phase_values = [row[index + 1] for row in rows if len(row) > index + 1]
+                    ac_traces.append(
+                        SimulationTrace(
+                            name=_waveform_name(magnitude_name),
+                            values=magnitude_values,
+                            phase_values=phase_values,
+                        )
                     )
-                )
-                index += 2
+                    index += 2
+                else:
+                    ac_traces.append(
+                        SimulationTrace(
+                            name=_waveform_name(magnitude_name),
+                            values=magnitude_values,
+                            phase_values=None,
+                        )
+                    )
+                    index += 1
             return SimulationResult(
                 backend="ngspice-cli",
                 analysis=analysis,
@@ -647,13 +682,14 @@ class NgspiceRunner:
                 break
 
         x_values = [row[x_index] for row in rows if len(row) > x_index]
+        scale_names = {"time", "frequency", "v-sweep", "v(v-sweep)", "i-sweep"}
         general_traces = [
             SimulationTrace(
                 name=_waveform_name(name),
                 values=[row[index] for row in rows if len(row) > index],
             )
             for index, name in enumerate(header)
-            if index != x_index
+            if index != x_index and name.lower() not in scale_names
         ]
         return SimulationResult(
             backend="ngspice-cli",
