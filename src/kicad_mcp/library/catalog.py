@@ -39,6 +39,12 @@ def symbol_library_files() -> dict[str, Path]:
     return files
 
 
+_SYMBOL_HEADER_RE = re.compile(r'\(symbol\s+"([^"]+)"')
+_SUBUNIT_NAME_RE = re.compile(r"_\d+_\d+$")
+_DESCRIPTION_PROP_RE = re.compile(r'\(property\s+"Description"\s+"([^"]*)"')
+_KEYWORDS_PROP_RE = re.compile(r'\(property\s+"ki_keywords"\s+"([^"]*)"')
+
+
 def build_symbol_index() -> dict[str, dict[str, str]]:
     """Build the in-memory search index from discoverable symbol libraries."""
     index: dict[str, dict[str, str]] = {}
@@ -47,21 +53,22 @@ def build_symbol_index() -> dict[str, dict[str, str]]:
             content = sym_file.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
-        for match in re.finditer(r'\(symbol\s+"([^"]+)"', content):
+        top_matches = [
+            m
+            for m in _SYMBOL_HEADER_RE.finditer(content)
+            if not _SUBUNIT_NAME_RE.search(m.group(1))
+        ]
+        for idx, match in enumerate(top_matches):
             symbol_name = match.group(1)
-            if re.search(r"_\d+_\d+$", symbol_name):
-                continue
+            end_pos = (
+                top_matches[idx + 1].start()
+                if idx + 1 < len(top_matches)
+                else len(content)
+            )
+            chunk = content[match.start() : end_pos]
+            description_match = _DESCRIPTION_PROP_RE.search(chunk)
+            keyword_match = _KEYWORDS_PROP_RE.search(chunk)
             key = f"{library}:{symbol_name}"
-            description_match = re.search(
-                rf'\(symbol\s+"{re.escape(symbol_name)}".*?\(property\s+"Description"\s+"([^"]*)"',
-                content,
-                re.DOTALL,
-            )
-            keyword_match = re.search(
-                rf'\(symbol\s+"{re.escape(symbol_name)}".*?\(property\s+"ki_keywords"\s+"([^"]*)"',
-                content,
-                re.DOTALL,
-            )
             index[key] = {
                 "library": library,
                 "name": symbol_name,
