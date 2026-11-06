@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import re
+import tempfile
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -43,12 +45,23 @@ _SYMBOL_HEADER_RE = re.compile(r'\(symbol\s+"([^"]+)"')
 _SUBUNIT_NAME_RE = re.compile(r"_\d+_\d+$")
 _DESCRIPTION_PROP_RE = re.compile(r'\(property\s+"Description"\s+"([^"]*)"')
 _KEYWORDS_PROP_RE = re.compile(r'\(property\s+"ki_keywords"\s+"([^"]*)"')
+_SYMBOL_INDEX_CACHE_PATH = Path(tempfile.gettempdir()) / "kicad_mcp_symbol_index_v1.json"
 
 
 def build_symbol_index() -> dict[str, dict[str, str]]:
     """Build the in-memory search index from discoverable symbol libraries."""
+    lib_files = symbol_library_files()
+    cache_sig = f"{len(lib_files)}:{max((f.stat().st_mtime_ns for f in lib_files.values() if f.exists()), default=0)}"
+    try:
+        if _SYMBOL_INDEX_CACHE_PATH.exists():
+            cached = json.loads(_SYMBOL_INDEX_CACHE_PATH.read_text(encoding="utf-8"))
+            if isinstance(cached, dict) and cached.get("sig") == cache_sig and isinstance(cached.get("index"), dict):
+                return cached["index"]
+    except Exception:
+        pass
+
     index: dict[str, dict[str, str]] = {}
-    for library, sym_file in symbol_library_files().items():
+    for library, sym_file in lib_files.items():
         try:
             content = sym_file.read_text(encoding="utf-8", errors="ignore")
         except OSError:
@@ -75,6 +88,13 @@ def build_symbol_index() -> dict[str, dict[str, str]]:
                 "description": description_match.group(1) if description_match else "",
                 "keywords": keyword_match.group(1) if keyword_match else "",
             }
+
+    try:
+        tmp_path = _SYMBOL_INDEX_CACHE_PATH.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps({"sig": cache_sig, "index": index}), encoding="utf-8")
+        tmp_path.replace(_SYMBOL_INDEX_CACHE_PATH)
+    except Exception:
+        pass
     return index
 
 
