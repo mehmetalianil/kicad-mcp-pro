@@ -28,6 +28,8 @@ type NormalizeLabelJustify = Callable[[str | None], str | None]
 type SetLabelJustify = Callable[[str, str], str]
 
 _JUNCTION_AT_RE = re.compile(r"\(at\s+([-\d.]+)\s+([-\d.]+)\)")
+_LABEL_HEADER_RE = re.compile(r"\((?:label|global_label|hierarchical_label)\b")
+_SYM_OR_WIRE_RE = re.compile(r"\((?:symbol|wire)\b")
 
 
 class TransactionalWrite(Protocol):
@@ -71,17 +73,22 @@ def strip_junctions_without_wire_ends(
     last = 0
     removed = 0
     while cursor < len(text):
-        if text[cursor:].startswith("(junction"):
-            block, length = extract_block(text, cursor)
-            at = _JUNCTION_AT_RE.search(block) if block else None
-            if at is not None and length:
-                point = (round(float(at.group(1)), 4), round(float(at.group(2)), 4))
-                if point not in ends:
-                    pieces.append(text[last:cursor])
-                    cursor += length
-                    last = cursor
-                    removed += 1
-                    continue
+        idx = text.find("(junction", cursor)
+        if idx < 0:
+            break
+        cursor = idx
+        block, length = extract_block(text, cursor)
+        at = _JUNCTION_AT_RE.search(block) if block else None
+        if at is not None and length:
+            point = (round(float(at.group(1)), 4), round(float(at.group(2)), 4))
+            if point not in ends:
+                pieces.append(text[last:cursor])
+                cursor += length
+                last = cursor
+                removed += 1
+                continue
+            cursor += length
+            continue
         cursor += 1
     pieces.append(text[last:])
     return "".join(pieces), removed
@@ -145,27 +152,32 @@ class SchematicDestructiveEditService:
             last = 0
             removed = False
             while cursor < len(current_text):
-                if current_text[cursor:].startswith("(wire"):
-                    block, length = self.extract_block(current_text, cursor)
-                    parsed = self.parse_wire_block(block) if block else None
-                    if parsed is not None:
-                        signature = self.wire_signature(
-                            parsed["x1"],
-                            parsed["y1"],
-                            parsed["x2"],
-                            parsed["y2"],
-                        )
-                        parsed_uuid = str(parsed.get("uuid", ""))
-                        if (
-                            signature == target_signature
-                            and parsed_uuid
-                            and self.wire_id_matches(parsed_uuid, str(target["uuid"]))
-                        ):
-                            pieces.append(current_text[last:cursor])
-                            cursor += length
-                            last = cursor
-                            removed = True
-                            continue
+                idx = current_text.find("(wire", cursor)
+                if idx < 0:
+                    break
+                cursor = idx
+                block, length = self.extract_block(current_text, cursor)
+                parsed = self.parse_wire_block(block) if block else None
+                if parsed is not None and length:
+                    signature = self.wire_signature(
+                        parsed["x1"],
+                        parsed["y1"],
+                        parsed["x2"],
+                        parsed["y2"],
+                    )
+                    parsed_uuid = str(parsed.get("uuid", ""))
+                    if (
+                        signature == target_signature
+                        and parsed_uuid
+                        and self.wire_id_matches(parsed_uuid, str(target["uuid"]))
+                    ):
+                        pieces.append(current_text[last:cursor])
+                        cursor += length
+                        last = cursor
+                        removed = True
+                        continue
+                    cursor += length
+                    continue
                 cursor += 1
             pieces.append(current_text[last:])
             if not removed:
@@ -205,7 +217,11 @@ class SchematicDestructiveEditService:
             cursor = 0
             last = 0
             while cursor < len(current):
-                if current[cursor:].startswith("(symbol"):
+                m = _SYM_OR_WIRE_RE.search(current, cursor)
+                if m is None:
+                    break
+                cursor = m.start()
+                if current.startswith("(symbol", cursor):
                     block, length = self.extract_block(current, cursor)
                     parsed = self.parse_symbol_block(block) if block else None
                     if parsed is not None and parsed["reference"] == reference:
@@ -213,7 +229,10 @@ class SchematicDestructiveEditService:
                         cursor += length
                         last = cursor
                         continue
-                if current[cursor:].startswith("(wire"):
+                    if length:
+                        cursor += length
+                        continue
+                elif current.startswith("(wire", cursor):
                     block, length = self.extract_block(current, cursor)
                     parsed_wire = self.parse_wire_block(block) if block else None
                     if parsed_wire is not None:
@@ -225,6 +244,9 @@ class SchematicDestructiveEditService:
                             cursor += length
                             last = cursor
                             continue
+                    if length:
+                        cursor += length
+                        continue
                 cursor += 1
             pieces.append(current[last:])
             return "".join(pieces)
@@ -261,16 +283,19 @@ class SchematicDestructiveEditService:
             cursor = 0
             last = 0
             while cursor < len(current):
-                if current[cursor:].startswith(("(label", "(global_label", "(hierarchical_label")):
-                    block, length = self.extract_block(current, cursor)
-                    parsed = self.parse_label_block(block) if block else None
-                    if parsed is not None and parsed["name"] == name and matches_target(parsed):
-                        pieces.append(current[last:cursor])
-                        cursor += length
-                        last = cursor
-                        removed += 1
-                        continue
-                cursor += 1
+                m = _LABEL_HEADER_RE.search(current, cursor)
+                if m is None:
+                    break
+                cursor = m.start()
+                block, length = self.extract_block(current, cursor)
+                parsed = self.parse_label_block(block) if block else None
+                if parsed is not None and parsed["name"] == name and matches_target(parsed):
+                    pieces.append(current[last:cursor])
+                    cursor += length
+                    last = cursor
+                    removed += 1
+                    continue
+                cursor += max(length, 1)
             pieces.append(current[last:])
             if removed == 0:
                 raise ValueError(
@@ -310,16 +335,19 @@ class SchematicDestructiveEditService:
             cursor = 0
             last = 0
             while cursor < len(current):
-                if current[cursor:].startswith("(no_connect"):
-                    block, length = self.extract_block(current, cursor)
-                    parsed = self.parse_no_connect_block(block) if block else None
-                    if parsed is not None and matches_target(parsed):
-                        pieces.append(current[last:cursor])
-                        cursor += length
-                        last = cursor
-                        removed += 1
-                        continue
-                cursor += 1
+                idx = current.find("(no_connect", cursor)
+                if idx < 0:
+                    break
+                cursor = idx
+                block, length = self.extract_block(current, cursor)
+                parsed = self.parse_no_connect_block(block) if block else None
+                if parsed is not None and matches_target(parsed):
+                    pieces.append(current[last:cursor])
+                    cursor += length
+                    last = cursor
+                    removed += 1
+                    continue
+                cursor += max(length, 1)
             pieces.append(current[last:])
             if removed == 0:
                 raise ValueError(
@@ -360,34 +388,37 @@ class SchematicDestructiveEditService:
             cursor = 0
             last = 0
             while cursor < len(current):
-                if moved == 0 and current[cursor:].startswith(
-                    ("(label", "(global_label", "(hierarchical_label")
+                if moved != 0:
+                    break
+                m = _LABEL_HEADER_RE.search(current, cursor)
+                if m is None:
+                    break
+                cursor = m.start()
+                block, length = self.extract_block(current, cursor)
+                parsed = self.parse_label_block(block) if block else None
+                if (
+                    parsed is not None
+                    and parsed["name"] == name
+                    and abs(float(parsed["x"]) - x_mm) <= tolerance
+                    and abs(float(parsed["y"]) - y_mm) <= tolerance
                 ):
-                    block, length = self.extract_block(current, cursor)
-                    parsed = self.parse_label_block(block) if block else None
-                    if (
-                        parsed is not None
-                        and parsed["name"] == name
-                        and abs(float(parsed["x"]) - x_mm) <= tolerance
-                        and abs(float(parsed["y"]) - y_mm) <= tolerance
-                    ):
-                        rotation = (
-                            int(parsed["rotation"]) if new_rotation is None else int(new_rotation)
-                        )
-                        updated_block = re.sub(
-                            r"\(at\s+[-\d.]+\s+[-\d.]+\s+[-\d.]+\)",
-                            f"(at {self.format_mm(target_x)} "
-                            f"{self.format_mm(target_y)} {rotation})",
-                            block,
-                            count=1,
-                        )
-                        pieces.append(current[last:cursor])
-                        pieces.append(updated_block)
-                        cursor += length
-                        last = cursor
-                        moved += 1
-                        continue
-                cursor += 1
+                    rotation = (
+                        int(parsed["rotation"]) if new_rotation is None else int(new_rotation)
+                    )
+                    updated_block = re.sub(
+                        r"\(at\s+[-\d.]+\s+[-\d.]+\s+[-\d.]+\)",
+                        f"(at {self.format_mm(target_x)} "
+                        f"{self.format_mm(target_y)} {rotation})",
+                        block,
+                        count=1,
+                    )
+                    pieces.append(current[last:cursor])
+                    pieces.append(updated_block)
+                    cursor += length
+                    last = cursor
+                    moved += 1
+                    continue
+                cursor += max(length, 1)
             pieces.append(current[last:])
             if moved == 0:
                 raise ValueError(
@@ -426,25 +457,28 @@ class SchematicDestructiveEditService:
             cursor = 0
             last = 0
             while cursor < len(current):
-                if modified == 0 and current[cursor:].startswith(
-                    ("(label", "(global_label", "(hierarchical_label")
+                if modified != 0:
+                    break
+                m = _LABEL_HEADER_RE.search(current, cursor)
+                if m is None:
+                    break
+                cursor = m.start()
+                block, length = self.extract_block(current, cursor)
+                parsed = self.parse_label_block(block) if block else None
+                if (
+                    parsed is not None
+                    and parsed["name"] == name
+                    and abs(float(parsed["x"]) - x_mm) <= tolerance
+                    and abs(float(parsed["y"]) - y_mm) <= tolerance
                 ):
-                    block, length = self.extract_block(current, cursor)
-                    parsed = self.parse_label_block(block) if block else None
-                    if (
-                        parsed is not None
-                        and parsed["name"] == name
-                        and abs(float(parsed["x"]) - x_mm) <= tolerance
-                        and abs(float(parsed["y"]) - y_mm) <= tolerance
-                    ):
-                        updated_block = self.set_label_justify(block, resolved_justify)
-                        pieces.append(current[last:cursor])
-                        pieces.append(updated_block)
-                        cursor += length
-                        last = cursor
-                        modified += 1
-                        continue
-                cursor += 1
+                    updated_block = self.set_label_justify(block, resolved_justify)
+                    pieces.append(current[last:cursor])
+                    pieces.append(updated_block)
+                    cursor += length
+                    last = cursor
+                    modified += 1
+                    continue
+                cursor += max(length, 1)
             pieces.append(current[last:])
             if modified == 0:
                 raise ValueError(
