@@ -2317,6 +2317,7 @@ def _wire_signature(
     return (start, end) if start <= end else (end, start)
 
 
+@functools.lru_cache(maxsize=4096)
 def _parse_symbol_block(block: str) -> dict[str, Any] | None:
     lib_id_match = re.search(rf"\(lib_id\s+{_STRING_PATTERN}\)", block)
     if lib_id_match is None:
@@ -2591,6 +2592,40 @@ def _add_symbol_primitive_points(
     )
 
 
+@functools.lru_cache(maxsize=4096)
+def _cached_local_primitive_bounds(
+    sym_file_str: str,
+    mtime_ns: int,
+    symbol_name: str,
+    rotation: int,
+    unit: int,
+    mirror: str,
+) -> tuple[float, float, float, float] | None:
+    blocks = _cached_symbol_blocks(sym_file_str, mtime_ns, symbol_name)
+    if not blocks:
+        return None
+
+    xs: list[float] = []
+    ys: list[float] = []
+
+    for block in blocks:
+        block_name = _symbol_block_name(block)
+        child_blocks = _extract_child_symbol_blocks(block) if block_name is not None else []
+        unit_prefixes = (f"{block_name}_{unit}_", f"{block_name}_0_")
+        target_blocks = [
+            cblock for cname, cblock in child_blocks if cname.startswith(unit_prefixes)
+        ]
+        if not target_blocks:
+            target_blocks = [block]
+
+        for target in target_blocks:
+            _add_symbol_primitive_points(xs, ys, target, (0.0, 0.0), rotation, mirror)
+
+    if not xs or not ys:
+        return None
+    return (round(min(xs), 4), round(min(ys), 4), round(max(xs), 4), round(max(ys), 4))
+
+
 def get_symbol_primitive_bounds(
     library: str,
     symbol_name: str,
@@ -2608,34 +2643,21 @@ def get_symbol_primitive_bounds(
     sym_file = _symbol_library_file(library)
     if sym_file is None:
         return None
-
-    blocks = _load_symbol_blocks(sym_file, symbol_name)
-    if not blocks:
+    try:
+        mtime_ns = sym_file.stat().st_mtime_ns
+    except OSError:
         return None
-
-    xs: list[float] = []
-    ys: list[float] = []
-
-    for block in blocks:
-        block_name = _symbol_block_name(block)
-        child_blocks = _extract_child_symbol_blocks(block) if block_name is not None else []
-        unit_prefixes = (f"{block_name}_{unit}_", f"{block_name}_0_")
-        target_blocks = [
-            cblock for cname, cblock in child_blocks if cname.startswith(unit_prefixes)
-        ]
-        if not target_blocks:
-            # Symbols that carry their primitives inline -- flattened ``extends``
-            # chains and imported parts -- have no matching unit children, so the
-            # root block is parsed as-is.
-            target_blocks = [block]
-
-        origin = (sym_x, sym_y)
-        for target in target_blocks:
-            _add_symbol_primitive_points(xs, ys, target, origin, rotation, mirror)
-
-    if not xs or not ys:
+    local = _cached_local_primitive_bounds(
+        str(sym_file), mtime_ns, symbol_name, rotation, unit, mirror
+    )
+    if local is None:
         return None
-    return (round(min(xs), 4), round(min(ys), 4), round(max(xs), 4), round(max(ys), 4))
+    return (
+        round(local[0] + sym_x, 4),
+        round(local[1] + sym_y, 4),
+        round(local[2] + sym_x, 4),
+        round(local[3] + sym_y, 4),
+    )
 
 
 def get_sheet_pin_outward_normals(
@@ -2829,6 +2851,11 @@ def _placed_symbol_bbox(symbol: dict[str, Any]) -> BBox:
 def _get_symbol_bboxes(sexpr_content: str) -> list[BBox]:
     symbols: list[dict[str, Any]] = []
     cursor = 0
+    lib_idx = sexpr_content.find("(lib_symbols")
+    if lib_idx >= 0:
+        _, lib_len = _extract_block(sexpr_content, lib_idx)
+        if lib_len > 0:
+            cursor = lib_idx + lib_len
     while cursor < len(sexpr_content):
         idx = sexpr_content.find("(symbol", cursor)
         if idx < 0:
@@ -3392,24 +3419,30 @@ def _project_symbol_library_files() -> dict[str, Path]:
     project_dir = _schematic_project_dir()
     if project_dir is None:
         return {}
+    files: dict[str, Path] = {}
     table = project_dir / "sym-lib-table"
     try:
         content = table.read_text(encoding="utf-8", errors="ignore")
     except OSError:
-        return {}
+        content = ""
 
-    files: dict[str, Path] = {}
-    for chunk in re.split(r"\(lib\b", content)[1:]:
-        name = re.search(r'\(name\s+"?([^")\s]+)"?\)', chunk)
-        type_ = re.search(r'\(type\s+"?([^")\s]+)"?\)', chunk)
-        uri = re.search(r'\(uri\s+"([^"]+)"\)', chunk)
-        if not (name and uri):
-            continue
-        if type_ and type_.group(1).lower() != "kicad":
-            continue
-        resolved = Path(_resolve_kicad_table_uri(uri.group(1), project_dir))
-        if resolved.exists():
-            files.setdefault(name.group(1), resolved)
+    if content:
+        for chunk in re.split(r"\(lib\b", content)[1:]:
+            name = re.search(r'\(name\s+"?([^")\s]+)"?\)', chunk)
+            type_ = re.search(r'\(type\s+"?([^")\s]+)"?\)', chunk)
+            uri = re.search(r'\(uri\s+"([^"]+)"\)', chunk)
+            if not (name and uri):
+                continue
+            if type_ and type_.group(1).lower() != "kicad":
+                continue
+            resolved = Path(_resolve_kicad_table_uri(uri.group(1), project_dir))
+            if resolved.exists():
+                files.setdefault(name.group(1), resolved)
+
+    for search_dir in (project_dir, project_dir / "symbols", project_dir / "output" / "symbols"):
+        if search_dir.exists():
+            for sym_file in sorted(search_dir.glob("*.kicad_sym")):
+                files.setdefault(sym_file.stem, sym_file)
     return files
 
 
@@ -3596,6 +3629,7 @@ def _symbol_block_name(block: str) -> str | None:
     return match.group(1) if match else None
 
 
+@functools.lru_cache(maxsize=4096)
 def _extract_child_symbol_blocks(block: str) -> list[tuple[str, str]]:
     children: list[tuple[str, str]] = []
     depth = 0
@@ -3632,6 +3666,7 @@ def _extract_child_symbol_blocks(block: str) -> list[tuple[str, str]]:
     return children
 
 
+@functools.lru_cache(maxsize=4096)
 def _strip_child_symbol_blocks(block: str) -> str:
     stripped = block
     for _, child_block in _extract_child_symbol_blocks(block):
@@ -3639,6 +3674,7 @@ def _strip_child_symbol_blocks(block: str) -> str:
     return stripped
 
 
+@functools.lru_cache(maxsize=4096)
 def _extract_pin_definitions(block: str) -> dict[str, tuple[float, float]]:
     return {
         record["number"]: (float(record["x"]), float(record["y"]))
@@ -3646,6 +3682,7 @@ def _extract_pin_definitions(block: str) -> dict[str, tuple[float, float]]:
     }
 
 
+@functools.lru_cache(maxsize=4096)
 def _extract_pin_records(block: str) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     cursor = 0
@@ -3771,6 +3808,40 @@ def _available_units_from_blocks(blocks: list[str]) -> set[int]:
     return units
 
 
+@functools.lru_cache(maxsize=4096)
+def _cached_local_pin_offsets(
+    sym_file_str: str,
+    mtime_ns: int,
+    symbol_name: str,
+    rotation: int,
+    unit: int,
+    mirror: str,
+) -> tuple[tuple[str, float, float], ...]:
+    blocks = list(_cached_symbol_blocks(sym_file_str, mtime_ns, symbol_name))
+    if not blocks:
+        return ()
+    available_units = _available_units_from_blocks(blocks)
+    if available_units and unit not in available_units:
+        return ()
+
+    pins: dict[str, tuple[float, float]] = {}
+    for block in blocks:
+        direct_pins = _extract_pin_definitions(_strip_child_symbol_blocks(block))
+        for pin_number, (px, py) in direct_pins.items():
+            pins[pin_number] = _place_pin(px, py, 0.0, 0.0, rotation, mirror)
+
+        block_name = _symbol_block_name(block)
+        if block_name is None:
+            continue
+        unit_prefixes = (f"{block_name}_{unit}_", f"{block_name}_0_")
+        for child_name, child_block in _extract_child_symbol_blocks(block):
+            if not child_name.startswith(unit_prefixes):
+                continue
+            for pin_number, (px, py) in _extract_pin_definitions(child_block).items():
+                pins[pin_number] = _place_pin(px, py, 0.0, 0.0, rotation, mirror)
+    return tuple((k, v[0], v[1]) for k, v in pins.items())
+
+
 def get_pin_positions(
     library: str,
     symbol_name: str,
@@ -3787,33 +3858,16 @@ def get_pin_positions(
     sym_file = _symbol_library_file(library)
     if sym_file is None:
         return {}
-
-    blocks = _load_symbol_blocks(sym_file, symbol_name)
-    if not blocks:
+    try:
+        mtime_ns = sym_file.stat().st_mtime_ns
+    except OSError:
         return {}
-    available_units = _available_units_from_blocks(blocks)
-    if available_units and unit not in available_units:
-        return {}
-
-    pins: dict[str, tuple[float, float]] = {}
-    for block in blocks:
-        direct_pins = _extract_pin_definitions(_strip_child_symbol_blocks(block))
-        for pin_number, (px, py) in direct_pins.items():
-            pins[pin_number] = _place_pin(px, py, sym_x, sym_y, rotation, mirror)
-
-        block_name = _symbol_block_name(block)
-        if block_name is None:
-            continue
-        # Match the requested unit and unit 0 (pins common to all units, where
-        # single-unit easyeda2kicad imports place every pin).
-        unit_prefixes = (f"{block_name}_{unit}_", f"{block_name}_0_")
-        for child_name, child_block in _extract_child_symbol_blocks(block):
-            if not child_name.startswith(unit_prefixes):
-                continue
-            for pin_number, (px, py) in _extract_pin_definitions(child_block).items():
-                # KiCad's pin (at x y angle) coordinate is the electrical connection point.
-                pins[pin_number] = _place_pin(px, py, sym_x, sym_y, rotation, mirror)
-    return pins
+    return {
+        pin_number: (round(sym_x + dx, 4), round(sym_y + dy, 4))
+        for pin_number, dx, dy in _cached_local_pin_offsets(
+            str(sym_file), mtime_ns, symbol_name, rotation, unit, mirror
+        )
+    }
 
 
 def get_pin_metadata(
@@ -4315,6 +4369,7 @@ def _pin_record_normal(record: dict[str, Any], rotation: int, mirror: str) -> tu
     return _place_normal(ox, oy, rotation, mirror)
 
 
+@functools.lru_cache(maxsize=4096)
 def _unit_pin_records(block: str, unit: int) -> list[dict[str, Any]]:
     """Collect direct and requested-unit pin records for one symbol block."""
     records = list(_extract_pin_records(_strip_child_symbol_blocks(block)))
@@ -4341,6 +4396,24 @@ def _pin_normal_map(
     return normals
 
 
+@functools.lru_cache(maxsize=4096)
+def _cached_pin_outward_normals(
+    sym_file_str: str,
+    mtime_ns: int,
+    symbol_name: str,
+    rotation: int,
+    unit: int,
+    mirror: str,
+) -> tuple[tuple[str, tuple[float, float]], ...]:
+    blocks = list(_cached_symbol_blocks(sym_file_str, mtime_ns, symbol_name))
+    if not blocks:
+        return ()
+    available_units = _available_units_from_blocks(blocks)
+    if available_units and unit not in available_units:
+        return ()
+    return tuple(_pin_normal_map(blocks, unit, rotation, mirror).items())
+
+
 def get_pin_outward_normals(
     library: str,
     symbol_name: str,
@@ -4348,27 +4421,19 @@ def get_pin_outward_normals(
     unit: int = 1,
     mirror: str = "",
 ) -> dict[str, tuple[float, float]]:
-    """Direction a wire leaves each pin in, in schematic space.
-
-    Real data from the symbol definition -- the pin's ``(at x y angle)`` -- not a
-    guess from the keepout box.  The nearest-edge heuristic agrees with it only
-    while the pin sits on its symbol's perimeter, a precondition the tests
-    already flag as fragile: a graphic overhanging a pin by more than one grid
-    unit picks the wrong edge, and a pin whose symbol is drawn asymmetrically
-    can too.
-    """
+    """Direction a wire leaves each pin in, in schematic space."""
     sym_file = _symbol_library_file(library)
     if sym_file is None:
         return {}
-
-    blocks = _load_symbol_blocks(sym_file, symbol_name)
-    if not blocks:
+    try:
+        mtime_ns = sym_file.stat().st_mtime_ns
+    except OSError:
         return {}
-    available_units = _available_units_from_blocks(blocks)
-    if available_units and unit not in available_units:
-        return {}
-
-    return _pin_normal_map(blocks, unit, rotation, mirror)
+    return dict(
+        _cached_pin_outward_normals(
+            str(sym_file), mtime_ns, symbol_name, rotation, unit, mirror
+        )
+    )
 
 
 def _escape_direction(point: tuple[float, float], owner: BBox) -> tuple[float, float]:
@@ -4505,6 +4570,11 @@ def _foreign_pin_escape_stubs(
     stubs: list[tuple[float, float, float, float]] = []
     tol = SNAP_TOLERANCE_MM
     cursor = 0
+    lib_idx = content.find("(lib_symbols")
+    if lib_idx >= 0:
+        _, lib_len = _extract_block(content, lib_idx)
+        if lib_len > 0:
+            cursor = lib_idx + lib_len
     while cursor < len(content):
         idx = content.find("(symbol", cursor)
         if idx < 0:

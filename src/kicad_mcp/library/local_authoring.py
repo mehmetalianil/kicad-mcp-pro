@@ -56,6 +56,28 @@ def _append_symbol(content: str, symbol_block: str) -> str:
     return content + symbol_block
 
 
+def _register_in_project_sym_lib_table(project_dir: Path | None, lib_file: Path) -> None:
+    if project_dir is None or not project_dir.exists():
+        return
+    nickname = lib_file.stem
+    try:
+        rel = lib_file.resolve().relative_to(project_dir.resolve())
+        uri = f"${{KIPRJMOD}}/{rel.as_posix()}"
+    except ValueError:
+        uri = str(lib_file.resolve())
+    table_path = project_dir / "sym-lib-table"
+    entry = f'  (lib (name "{nickname}")(type "KiCad")(uri "{uri}")(options "")(descr "Project local symbol library"))\n'
+    if table_path.exists():
+        content = table_path.read_text(encoding="utf-8", errors="ignore")
+        if f'(name "{nickname}")' in content or f"(name {nickname})" in content:
+            return
+        if content.rstrip().endswith(")"):
+            updated = content.rstrip()[:-1] + f"\n{entry})\n"
+            table_path.write_text(updated, encoding="utf-8")
+    else:
+        table_path.write_text(f"(sym_lib_table\n  (version 7)\n{entry})\n", encoding="utf-8")
+
+
 def _pin_specs_from_rows(pins: list[dict[str, Any]]) -> tuple[list[PinSpec], str | None]:
     pin_specs: list[PinSpec] = []
     for raw in pins:
@@ -110,7 +132,8 @@ class LibraryLocalAuthoringService:
         library_file.write_text(content, encoding="utf-8")
         if self.upgrade_symbol_library is not None:
             self.upgrade_symbol_library(library_file)
-        return f"Created custom symbol '{name}' in {library_file}."
+        _register_in_project_sym_lib_table(project_dir, library_file)
+        return f"Created custom symbol '{name}' in {library_file} (use library='{library_file.stem}', symbol_name='{name}')."
 
     def generate_symbol_from_pintable(
         self,
@@ -157,6 +180,7 @@ class LibraryLocalAuthoringService:
 
         out_file.parent.mkdir(parents=True, exist_ok=True)
         out_file.write_text(sexpr, encoding="utf-8")
+        _register_in_project_sym_lib_table(self.project_dir(), out_file)
         format_upgrade = (
             self.upgrade_symbol_library(out_file)
             if self.upgrade_symbol_library is not None

@@ -38,6 +38,11 @@ def symbol_library_files() -> dict[str, Path]:
     for table in lib_table_paths("sym-lib-table", project_dir):
         for nickname, sym_path in parse_lib_table(table, project_dir).items():
             files.setdefault(nickname, sym_path)
+    if project_dir is not None:
+        for search_dir in (project_dir, project_dir / "symbols", project_dir / "output" / "symbols"):
+            if search_dir.exists():
+                for sym_file in sorted(search_dir.glob("*.kicad_sym")):
+                    files.setdefault(sym_file.stem, sym_file)
     return files
 
 
