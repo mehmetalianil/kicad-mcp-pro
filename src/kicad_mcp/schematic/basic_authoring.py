@@ -200,7 +200,8 @@ class SchematicBasicAuthoringService:
 
         def mutator(current: str) -> str:
             updated = current
-            if f'(symbol "{lib_id}"' not in updated:
+            existing_idx = updated.find(f'(symbol "{lib_id}"')
+            if existing_idx == -1:
                 if "(lib_symbols)" in updated:
                     updated = updated.replace(
                         "(lib_symbols)",
@@ -213,6 +214,31 @@ class SchematicBasicAuthoringService:
                         f"\t(lib_symbols\n\t{lib_definition}\n",
                         1,
                     )
+            else:
+                depth = 0
+                in_str = False
+                esc = False
+                end_idx = existing_idx
+                for i in range(existing_idx, len(updated)):
+                    ch = updated[i]
+                    if in_str:
+                        if esc:
+                            esc = False
+                        elif ch == "\\":
+                            esc = True
+                        elif ch == '"':
+                            in_str = False
+                    elif ch == '"':
+                        in_str = True
+                    elif ch == "(":
+                        depth += 1
+                    elif ch == ")":
+                        depth -= 1
+                        if depth == 0:
+                            end_idx = i + 1
+                            break
+                if end_idx > existing_idx:
+                    updated = updated[:existing_idx] + lib_definition + updated[end_idx:]
             block = self.place_symbol_block(
                 lib_id=lib_id,
                 x=symbol_x,

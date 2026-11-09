@@ -29,7 +29,20 @@ type SetLabelJustify = Callable[[str, str], str]
 
 _JUNCTION_AT_RE = re.compile(r"\(at\s+([-\d.]+)\s+([-\d.]+)\)")
 _LABEL_HEADER_RE = re.compile(r"\((?:label|global_label|hierarchical_label)\b")
-_SYM_OR_WIRE_RE = re.compile(r"\((?:symbol|wire)\b")
+_SYM_OR_WIRE_RE = re.compile(r"\((?:symbol|wire|no_connect)\b")
+
+
+def _cut_block_span(text: str, last: int, start: int, length: int) -> tuple[int, int]:
+    """Expand ``[start, start + length]`` to consume indentation and trailing newline."""
+    cut_start = start
+    while cut_start > last and text[cut_start - 1] in (" ", "\t"):
+        cut_start -= 1
+    cut_end = start + length
+    if cut_end < len(text) and text[cut_end] == "\r":
+        cut_end += 1
+    if cut_end < len(text) and text[cut_end] == "\n":
+        cut_end += 1
+    return cut_start, cut_end
 
 
 class TransactionalWrite(Protocol):
@@ -82,8 +95,9 @@ def strip_junctions_without_wire_ends(
         if at is not None and length:
             point = (round(float(at.group(1)), 4), round(float(at.group(2)), 4))
             if point not in ends:
-                pieces.append(text[last:cursor])
-                cursor += length
+                cut_start, cut_end = _cut_block_span(text, last, cursor, length)
+                pieces.append(text[last:cut_start])
+                cursor = cut_end
                 last = cursor
                 removed += 1
                 continue
@@ -171,8 +185,9 @@ class SchematicDestructiveEditService:
                         and parsed_uuid
                         and self.wire_id_matches(parsed_uuid, str(target["uuid"]))
                     ):
-                        pieces.append(current_text[last:cursor])
-                        cursor += length
+                        cut_start, cut_end = _cut_block_span(current_text, last, cursor, length)
+                        pieces.append(current_text[last:cut_start])
+                        cursor = cut_end
                         last = cursor
                         removed = True
                         continue
@@ -225,8 +240,9 @@ class SchematicDestructiveEditService:
                     block, length = self.extract_block(current, cursor)
                     parsed = self.parse_symbol_block(block) if block else None
                     if parsed is not None and parsed["reference"] == reference:
-                        pieces.append(current[last:cursor])
-                        cursor += length
+                        cut_start, cut_end = _cut_block_span(current, last, cursor, length)
+                        pieces.append(current[last:cut_start])
+                        cursor = cut_end
                         last = cursor
                         continue
                     if length:
@@ -240,8 +256,23 @@ class SchematicDestructiveEditService:
                         end = self.coordinate_key(parsed_wire["x2"], parsed_wire["y2"])
                         if start in connection_points or end in connection_points:
                             removed_wire_count += 1
-                            pieces.append(current[last:cursor])
-                            cursor += length
+                            cut_start, cut_end = _cut_block_span(current, last, cursor, length)
+                            pieces.append(current[last:cut_start])
+                            cursor = cut_end
+                            last = cursor
+                            continue
+                    if length:
+                        cursor += length
+                        continue
+                elif current.startswith("(no_connect", cursor):
+                    block, length = self.extract_block(current, cursor)
+                    parsed_nc = self.parse_no_connect_block(block) if block else None
+                    if parsed_nc is not None:
+                        nc_pt = self.coordinate_key(parsed_nc["x"], parsed_nc["y"])
+                        if nc_pt in connection_points:
+                            cut_start, cut_end = _cut_block_span(current, last, cursor, length)
+                            pieces.append(current[last:cut_start])
+                            cursor = cut_end
                             last = cursor
                             continue
                     if length:
@@ -290,8 +321,9 @@ class SchematicDestructiveEditService:
                 block, length = self.extract_block(current, cursor)
                 parsed = self.parse_label_block(block) if block else None
                 if parsed is not None and parsed["name"] == name and matches_target(parsed):
-                    pieces.append(current[last:cursor])
-                    cursor += length
+                    cut_start, cut_end = _cut_block_span(current, last, cursor, length)
+                    pieces.append(current[last:cut_start])
+                    cursor = cut_end
                     last = cursor
                     removed += 1
                     continue
@@ -332,6 +364,7 @@ class SchematicDestructiveEditService:
         def mutator(current: str) -> str:
             nonlocal removed
             pieces: list[str] = []
+            existing_nc: list[str] = []
             cursor = 0
             last = 0
             while cursor < len(current):
@@ -341,18 +374,28 @@ class SchematicDestructiveEditService:
                 cursor = idx
                 block, length = self.extract_block(current, cursor)
                 parsed = self.parse_no_connect_block(block) if block else None
-                if parsed is not None and matches_target(parsed):
-                    pieces.append(current[last:cursor])
-                    cursor += length
-                    last = cursor
-                    removed += 1
-                    continue
+                if parsed is not None:
+                    if matches_target(parsed):
+                        cut_start, cut_end = _cut_block_span(current, last, cursor, length)
+                        pieces.append(current[last:cut_start])
+                        cursor = cut_end
+                        last = cursor
+                        removed += 1
+                        continue
+                    existing_nc.append(
+                        f"({self.format_mm(float(parsed['x']))}, {self.format_mm(float(parsed['y']))})"
+                    )
                 cursor += max(length, 1)
             pieces.append(current[last:])
             if removed == 0:
+                hint = (
+                    f" Existing no-connect markers: {', '.join(existing_nc)}."
+                    if existing_nc
+                    else " No no-connect markers exist in the schematic."
+                )
                 raise ValueError(
                     f"No no-connect marker found near "
-                    f"({self.format_mm(x_mm)}, {self.format_mm(y_mm)})."
+                    f"({self.format_mm(x_mm)}, {self.format_mm(y_mm)}).{hint}"
                 )
             return "".join(pieces)
 

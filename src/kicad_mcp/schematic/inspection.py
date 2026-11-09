@@ -71,18 +71,27 @@ class SchematicInspectionService:
 
     def labels(self, schematic_file: Path) -> str:
         """Return the legacy public label listing for ``schematic_file``."""
-        labels = self.parse_schematic(schematic_file)["labels"]
-        if not labels:
+        data = self.parse_schematic(schematic_file)
+        labels = data["labels"]
+        no_connects = data.get("no_connects", [])
+        if not labels and not no_connects:
             return self.with_diagnostics(
                 "The active schematic contains no labels.",
                 schematic_file,
             )
-        lines = [f"Labels ({len(labels)} total):"]
-        lines.extend(
-            f"- {label['name']} @ ({label['x']}, {label['y']}) "
-            f"rot={label['rotation']} justify={label.get('justify') or 'center'}"
-            for label in labels
-        )
+        lines: list[str] = []
+        if labels:
+            lines.append(f"Labels ({len(labels)} total):")
+            lines.extend(
+                f"- {label['name']} @ ({label['x']}, {label['y']}) "
+                f"rot={label['rotation']} justify={label.get('justify') or 'center'}"
+                for label in labels
+            )
+        else:
+            lines.append("Labels (0 total):")
+        if no_connects:
+            lines.append(f"No-connect markers ({len(no_connects)} total):")
+            lines.extend(f"- ({nc[0]}, {nc[1]})" for nc in no_connects)
         return "\n".join(lines)
 
     def net_names(self, schematic_file: Path) -> str:

@@ -646,6 +646,7 @@ class _KicadSchApiBackend:
                 "wires": wires,
                 "labels": labels,
                 "buses": compatibility["buses"],
+                "no_connects": compatibility.get("no_connects", []),
             }
         except Exception as exc:
             logger.debug(
@@ -1887,6 +1888,7 @@ def _read_schematic_compatibility_data(sch_file: Path) -> dict[str, Any]:
         "wires": _extract_wires(content),
         "labels": _extract_labels(content),
         "buses": _extract_buses(content),
+        "no_connects": sorted(_extract_no_connects(content)),
         "lib_symbol_power_flags": _extract_lib_symbol_power_flags(content),
     }
 
@@ -2888,8 +2890,16 @@ def _remove_wire_blocks(content: str) -> str:
         cursor = idx
         block, length = _extract_block(content, cursor)
         if block and _parse_wire_block(block) is not None:
-            pieces.append(content[last:cursor])
-            cursor += length
+            cut_start = cursor
+            while cut_start > last and content[cut_start - 1] in (" ", "\t"):
+                cut_start -= 1
+            cut_end = cursor + length
+            if cut_end < len(content) and content[cut_end] == "\r":
+                cut_end += 1
+            if cut_end < len(content) and content[cut_end] == "\n":
+                cut_end += 1
+            pieces.append(content[last:cut_start])
+            cursor = cut_end
             last = cursor
             continue
         cursor += 1
@@ -3015,9 +3025,12 @@ def _normalize_schematic_wire_connectivity(content: str) -> str:
         uuid_map[_segment_key(segment)] = wire["uuid"]
 
     updated = _remove_wire_blocks(content)
-    for segment in deduped:
-        uid = uuid_map.get(_segment_key(segment))
-        updated = _append_before_sheet_instances(updated, wire_block(*segment, uuid_str=uid))
+    wire_blocks = "\n".join(
+        wire_block(*segment, uuid_str=uuid_map.get(_segment_key(segment)))
+        for segment in deduped
+    )
+    if wire_blocks:
+        updated = _append_before_sheet_instances(updated, wire_blocks)
     return _insert_junctions_for_batch(updated, _detect_t_intersections(deduped))
 
 
@@ -3540,12 +3553,24 @@ def _flatten_extends_symbol(library: str, symbol_name: str, blocks: list[str]) -
     if base_name:
         flat = flat.replace(f'(symbol "{base_name}"', f'(symbol "{library}:{symbol_name}"', 1)
     # Override inherited properties (Value, Footprint, Datasheet, ...) with the
-    # derived symbol's own values so the flattened symbol matches KiCad's library.
-    base_props = _symbol_property_blocks(base)
-    for prop_name, derived_prop in _symbol_property_blocks(blocks[-1]).items():
-        base_prop = base_props.get(prop_name)
-        if base_prop and base_prop in flat:
-            flat = flat.replace(base_prop, derived_prop, 1)
+    # derived symbol's own values, and append derived-only properties (such as
+    # ki_fp_filters) so the flattened symbol matches KiCad's library in ERC.
+    current_props = _symbol_property_blocks(base)
+    for child_block in blocks[1:]:
+        for prop_name, derived_prop in _symbol_property_blocks(child_block).items():
+            existing_prop = current_props.get(prop_name)
+            if existing_prop and existing_prop in flat:
+                flat = flat.replace(existing_prop, derived_prop, 1)
+                current_props[prop_name] = derived_prop
+            elif existing_prop is None:
+                last_prop = list(current_props.values())[-1] if current_props else None
+                if last_prop and last_prop in flat:
+                    flat = flat.replace(last_prop, f"{last_prop}\n\t\t{derived_prop}", 1)
+                else:
+                    sub_idx = flat.find(f'(symbol "{symbol_name}_')
+                    if sub_idx > 0:
+                        flat = flat[:sub_idx] + f"{derived_prop}\n\t\t" + flat[sub_idx:]
+                current_props[prop_name] = derived_prop
     return flat
 
 
@@ -6264,6 +6289,7 @@ def _transactional_write_to_schematic_file(
         sch_file = sch_file.resolve()
         current = sch_file.read_text(encoding="utf-8")
         updated = _normalize_schematic_wire_connectivity(mutator(current))
+        updated = re.sub(r"\n(?:[ \t]*\r?\n)+", "\n", updated)
         _validate_schematic_text(updated)
         _guard_schematic_structural_loss(
             sch_file, current, updated, allow_node_loss=allow_node_loss
